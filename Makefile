@@ -1,5 +1,5 @@
 # Nom de l'application
-APP_NAME := cloud-service
+APP_NAME := cloud_beast
 
 # Répertoire des fichiers sources
 SRC_DIR := ./cmd
