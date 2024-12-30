@@ -9,14 +9,14 @@ import (
 )
 
 // Générer une paire de clés RSA
-func generateRSAKeys() (*rsa.PrivateKey, error) {
+func GenerateRSAKeys(user string) (*rsa.PrivateKey, error) {
     privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
     if err != nil {
         return nil, err
     }
     
     // Enregistrement des clés
-    privateFile, err := os.Create("private.pem")
+    privateFile, err := os.Create(user + "-private.pem")
     if err != nil {
         return nil, err
     }
@@ -27,7 +27,7 @@ func generateRSAKeys() (*rsa.PrivateKey, error) {
     privateFile.Close()
 
     publicKey := &privateKey.PublicKey
-    publicFile, err := os.Create("public.pem")
+    publicFile, err := os.Create(user + "public.pem")
     if err != nil {
         return nil, err
     }

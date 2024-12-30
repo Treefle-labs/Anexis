@@ -9,7 +9,9 @@ TAILWIND_DIR := ./assets/css
 
 # Commandes externes
 GO := go
-GOW := ~/go/bin/gow
+GOROOT := $(shell go env GOROOT)
+GOPATH := $(shell go env GOPATH)
+GOW := $(GOPATH)/bin/gow
 PNPM := pnpm
 
 # Commande pour le build
@@ -38,9 +40,7 @@ run: build
 # Commande pour effectuer les migrations de base de données
 migrate:
 	@echo "Running database migrations..."
-	# Remplacez cette ligne par le code de migration de votre choix
-	# Exemple avec `migrate` :
-	# migrate -path ./migrations -database "your_database_url" up
+	atlas migrate diff --env gorm
 
 # Commande pour tester le code
 test:

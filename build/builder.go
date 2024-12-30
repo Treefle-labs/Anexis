@@ -6,11 +6,41 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"syscall"
 
-	
 	"github.com/evanw/esbuild/pkg/api"
 )
+
+// Créer un plugin pour modifier les imports
+func createImportPlugin() api.Plugin {
+	return api.Plugin{
+		Name: "import-extension",
+		Setup: func(build api.PluginBuild) {
+			build.OnLoad(api.OnLoadOptions{
+				Filter: `\.ts$`, // Cibler uniquement les fichiers TypeScript
+			}, func(args api.OnLoadArgs) (api.OnLoadResult, error) {
+				// Lire le contenu du fichier actuel
+				content, err := os.ReadFile(args.Path)
+				if err != nil {
+					return api.OnLoadResult{}, err
+				}
+
+				// Modifier les imports relatifs pour ajouter ".js"
+				updatedContent := regexp.MustCompile(`from\s+(['"])(\.{1,2}/[^'"]*)(['"])`).
+					ReplaceAllString(string(content), `from $1$2.js$1`)
+
+				return api.OnLoadResult{
+					Contents:   &updatedContent, // Contenu modifié
+					Loader:     api.LoaderTS,    // Garder le loader TypeScript
+					ResolveDir: filepath.Dir(args.Path), // Répertoire pour la résolution
+				}, nil
+			})
+		},
+	}
+}
+
+
 
 func buildTSFile(inputPath string) error {
 	outputPath := filepath.Join(
@@ -26,6 +56,11 @@ func buildTSFile(inputPath string) error {
 		Format:      api.FormatESModule,
 		Target:      api.ES2015,
 		Sourcemap:   api.SourceMapLinked,
+		Platform:    api.PlatformBrowser,
+		Loader: map[string]api.Loader{
+			".ts": api.LoaderTS, // Indiquer à esbuild de gérer les fichiers TypeScript
+		},
+		Plugins: []api.Plugin{createImportPlugin()},
 	})
 
 	if len(result.Errors) > 0 {
@@ -63,7 +98,7 @@ func WatchTSFiles(sourceDir string) error {
 		}
 		return nil
 	})
-    fmt.Println("Fichiers trouvés :", files)
+	fmt.Println("Fichiers trouvés :", files)
 	if err != nil {
 		log.Fatalf("Erreur lors du parcours des fichiers : %v", err)
 	}
@@ -84,6 +119,11 @@ func WatchTSFiles(sourceDir string) error {
 		Sourcemap:   api.SourceMapLinked,
 		Outdir:      "./client/js",
 		Platform:    api.PlatformBrowser,
+		Plugins: []api.Plugin{createImportPlugin()},
+		Loader: map[string]api.Loader{
+			".ts": api.LoaderTS, // Indiquer à esbuild de gérer les fichiers TypeScript
+		},
+		ResolveExtensions: []string{".ts", ".js"},
 	})
 	if err2 != nil {
 		return fmt.Errorf("failed to create build context: %v", err)

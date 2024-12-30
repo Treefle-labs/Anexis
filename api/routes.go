@@ -5,17 +5,19 @@ import (
 
 	"cloudbeast.doni/m/controllers"
 	"cloudbeast.doni/m/middleware"
+	"cloudbeast.doni/m/routes"
 	"github.com/gin-gonic/gin"
 )
 
 func SetupRouter(router *gin.Engine) {
     router.POST("/upload", controllers.UploadFile)
     router.GET("/file/:id", controllers.DownloadFile)
+    router.GET("/staticFile/:file", routes.Static)
     // Autres routes
-    authGroup := router.Group("/api")
-    authGroup.Use(middleware.ValidateJWT)
+    auth := router.Group("/auth")
+    auth.Use(middleware.ValidateJWT)
     {
-        authGroup.GET("/auth", func(ctx *gin.Context) {
+        auth.GET("/user", func(ctx *gin.Context) {
             user, _ := ctx.GetQuery("username")
             log.Default().Print(user)
         })
