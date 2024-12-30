@@ -9,6 +9,8 @@ import (
 
 func main() {
     router := gin.Default()
+    router.LoadHTMLGlob("templates/**/*")
+    router.StaticFS("/static", gin.Dir("./client", false))
     api.SetupRouter(router)
 
     err := router.Run(":8080") // Utilisation du port 8080 pour HTTP
