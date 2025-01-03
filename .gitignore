@@ -29,3 +29,4 @@ client
 node_modules
 test.db
 bin
+rsa/

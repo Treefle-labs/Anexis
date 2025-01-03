@@ -1,8 +1,9 @@
 package services
 
 import (
-    "compress/gzip"
-    "bytes"
+	"bytes"
+	"compress/gzip"
+	"io"
 )
 
 func CompressData(data []byte) ([]byte, error) {
@@ -19,6 +20,17 @@ func CompressData(data []byte) ([]byte, error) {
 
 
 func DecompressData(data []byte) ([]byte, error) {
-    // Code pour décompresser les données
-    return data, nil
+    b := bytes.NewBuffer(data)
+    gz, err := gzip.NewReader(b)
+    if err != nil {
+        return nil, err
+    }
+    defer gz.Close()
+    
+    decompressed, err := io.ReadAll(gz)
+    if err != nil {
+        return nil, err
+    }
+    
+    return decompressed, nil
 }

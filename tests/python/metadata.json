@@ -1,0 +1,9 @@
+{
+    "language": "python",
+    "build_cmd": "pip install cryptography",
+    "run_cmd": "python main.py %s %s %s",
+    "entry_points": {
+        "encrypt": "encrypt",
+        "decrypt": "decrypt"
+    }
+}

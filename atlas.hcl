@@ -9,7 +9,7 @@ data "external_schema" "gorm" {
 
 env "gorm" {
   src = data.external_schema.gorm.url
-  dev = "sqlite://db/test.db"
+  dev = "postgresql://doni:DoniLite13@localhost:5432/anexis"
   migration {
     dir = "file://migrations"
   }
