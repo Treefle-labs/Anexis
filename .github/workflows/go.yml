@@ -1,0 +1,81 @@
+name: Go CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.22'
+        
+    - name: Install dependencies
+      run: go mod download
+        
+    - name: Verify dependencies
+      run: go mod verify
+        
+    - name: Run vet
+      run: go vet ./...
+        
+    - name: Run tests
+      run: go test -v -race -cover ./...
+        
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@v3
+      with:
+        version: latest
+
+  build:
+    needs: test
+    name: Build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+        
+    - name: Build
+      run: go build -v ./...
+        
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: app
+        path: ./anexis  # Remplacez par le nom de votre binaire
+
+  # Décommentez cette section si vous voulez déployer sur un serveur
+  # deploy:
+  #   needs: build
+  #   name: Deploy
+  #   runs-on: ubuntu-latest
+  #   if: github.ref == 'refs/heads/main'
+  #   
+  #   steps:
+  #   - name: Download artifact
+  #     uses: actions/download-artifact@v3
+  #     with:
+  #       name: app
+  #   
+  #   - name: Deploy to server
+  #     uses: appleboy/scp-action@master
+  #     with:
+  #       host: ${{ secrets.HOST }}
+  #       username: ${{ secrets.USERNAME }}
+  #       key: ${{ secrets.SSH_PRIVATE_KEY }}
+  #       source: "app"
+  #       target: "/path/to/destination"

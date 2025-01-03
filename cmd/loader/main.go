@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-    stmts, err := gormschema.New("sqlite").Load(&models.User{}, &models.Product{})
+    stmts, err := gormschema.New("postgres").Load(&models.User{}, &models.Product{})
     if err != nil {
         fmt.Fprintf(os.Stderr, "failed to load gorm schema: %v\n", err)
         os.Exit(1)

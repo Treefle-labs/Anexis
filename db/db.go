@@ -1,7 +1,7 @@
 package db
 
 import (
-	"gorm.io/driver/sqlite"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -9,8 +9,8 @@ var DB gorm.DB
 
 // Contient la base de données du projet 'cloudbeast' gérée par `gorm ORM`
 func init() {
-  
-  db, err := gorm.Open(sqlite.Open("./db/test.db"), &gorm.Config{})
+  dsn := "host=localhost user=doni password=DoniLite13 dbname=anexis port=5432 sslmode=disable"
+  db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
   if err != nil {
     panic("failed to connect database")
   }

@@ -4,6 +4,7 @@ import (
 	"log"
 
 	"cloudbeast.doni/m/api"
+	"cloudbeast.doni/m/utils"
 	"github.com/gin-gonic/gin"
 )
 
@@ -17,4 +18,8 @@ func main() {
     if err != nil {
         log.Fatal("Error starting server: ", err)
     }
+}
+
+func init() {
+    utils.CreateDirectories([]string{})
 }
