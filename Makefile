@@ -79,9 +79,7 @@ version:
 # Watch combiné pour TypeScript, Tailwind et application
 watch:
 	@echo "Starting combined watch mode..."
-	(make watch-ts &) \
-	&& ($(PNPM) tailwindDev &) \
-	&& $(GOW) run $(SRC_DIR)/main.go
+	$(GOW) run $(SRC_DIR)/main.go
 
 # Commande par défaut
 .PHONY: build clean clean-ts run migrate test env install-deps build-ts watch-ts dev version watch

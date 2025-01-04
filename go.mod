@@ -8,7 +8,18 @@ require (
 	ariga.io/atlas-provider-gorm v0.5.0
 	github.com/docker/docker v27.4.1+incompatible
 	github.com/gin-gonic/gin v1.10.0
+	github.com/natewong1313/go-react-ssr v0.1.15
 	gorm.io/driver/postgres v1.5.11
+)
+
+require (
+	github.com/buger/jsonparser v1.1.1 // indirect
+	github.com/fsnotify/fsnotify v1.8.0 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/rs/zerolog v1.33.0 // indirect
+	github.com/tkrajina/go-reflector v0.5.8 // indirect
+	github.com/tkrajina/typescriptify-golang-structs v0.2.0 // indirect
 )
 
 require (
@@ -38,7 +49,7 @@ require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/sirupsen/logrus v1.9.3 // indirect
+	github.com/sirupsen/logrus v1.9.3
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.58.0 // indirect
 	go.opentelemetry.io/otel v1.33.0 // indirect
@@ -79,7 +90,7 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.2.12 // indirect
 	golang.org/x/arch v0.8.0 // indirect
-	golang.org/x/crypto v0.31.0
+	golang.org/x/crypto v0.31.0 // indirect
 	golang.org/x/net v0.32.0 // indirect
 	golang.org/x/sys v0.28.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
