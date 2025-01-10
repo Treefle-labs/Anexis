@@ -7,12 +7,14 @@ import (
 	"cloudbeast.doni/m/middleware"
 	"cloudbeast.doni/m/routes"
 	"github.com/gin-gonic/gin"
+    gossr "github.com/natewong1313/go-react-ssr"
 )
 
-func SetupRouter(router *gin.Engine) {
+func SetupRouter(router *gin.Engine, engine *gossr.Engine) {
     router.POST("/upload", controllers.UploadFile)
     router.GET("/file/:id", controllers.DownloadFile)
     router.GET("/staticFile/:file", routes.Static)
+    router.GET("/", routes.Index(engine))
     // Autres routes
     auth := router.Group("/auth")
     auth.Use(middleware.ValidateJWT)
