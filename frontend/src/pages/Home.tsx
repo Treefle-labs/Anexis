@@ -1,12 +1,14 @@
+import { Suspense } from 'react';
 import App from '../components/App';
+import { HomeView } from '../components/partials/HomeView';
 
 function Home() {
   return (
-    <App>
-      <div className=' text-3xl font-bold text-red-500 text-center bg-gradient-to-r from-red-500 to-orange-500'>
-        Home
-      </div>
-    </App>
+    <Suspense fallback={<>Loading</>}>
+      <App>
+        <HomeView />
+      </App>
+    </Suspense>
   );
 }
 
