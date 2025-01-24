@@ -11,6 +11,7 @@ import (
 )
 
 func SetupRouter(router *gin.Engine, engine *gossr.Engine) {
+    router.GET("/ping", controllers.PingRoute)
     router.POST("/upload", controllers.UploadFile)
     router.GET("/file/:id", controllers.DownloadFile)
     router.GET("/staticFile/:file", routes.Static)
