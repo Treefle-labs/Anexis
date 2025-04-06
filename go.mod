@@ -1,6 +1,6 @@
 module cloudbeast.doni/m
 
-go 1.22.7
+go 1.23.5
 
 toolchain go1.22.9
 

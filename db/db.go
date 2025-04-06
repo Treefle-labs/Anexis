@@ -5,14 +5,12 @@ import (
 	"gorm.io/gorm"
 )
 
-var DB gorm.DB
-
 // Contient la base de données du projet 'cloudbeast' gérée par `gorm ORM`
-func init() {
+func Setup() (*gorm.DB, error) {
   dsn := "host=localhost user=doni password=DoniLite13 dbname=anexis port=5432 sslmode=disable"
   db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
   if err != nil {
-    panic("failed to connect database")
+    return nil, err
   }
 
   // Migrate the schema
@@ -35,5 +33,5 @@ func init() {
   // Delete - delete product
   // db.Delete(&product, 1)
 
-  DB = *db
+  return db, nil
 }

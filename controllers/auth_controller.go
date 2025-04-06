@@ -18,6 +18,10 @@ type Claims struct {
 var JwtKey = []byte("your_secret_key") // Remplace par une clé secrète sécurisée
 
 func GenerateToken(c *gin.Context) {
+    dbx, err := db.Setup()
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"message": "Some features not initialize properly"})
+    }
     userID, ok := c.Get("userID")
     var user models.User
     if !ok {
@@ -25,7 +29,7 @@ func GenerateToken(c *gin.Context) {
         return
     }
 
-    result := db.DB.First(&user, userID.(int))
+    result := dbx.First(&user, userID.(int))
 
     if result.Error != nil {
         c.JSON(http.StatusNotFound, gin.H{"message": "not found user"})
