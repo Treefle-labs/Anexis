@@ -45,7 +45,7 @@ migrate:
 # Commande pour tester le code
 test:
 	@echo "Running tests..."
-	$(GO) test ./...
+	DOCKER_SOCKET_PATH=$(DOCKER_SOCKET_PATH) $(GO) test ./...
 
 # Commande pour afficher les variables d'environnement
 env:

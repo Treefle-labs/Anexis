@@ -7,28 +7,13 @@ import (
 
 	"cloudbeast.doni/m/api"
 	"github.com/gin-gonic/gin"
-	gossr "github.com/natewong1313/go-react-ssr"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestPingRoute(t *testing.T) {
 	router := gin.Default()
 
-    engineConfig := &gossr.Config{
-		AssetRoute:         "/static",
-		FrontendDir:        "../frontend/src",
-		GeneratedTypesPath: "../frontend/src/generated.d.ts",
-		PropsStructsPath:   "../models/props.go",
-		TailwindConfigPath: "../tailwind.config.js",
-		LayoutCSSFilePath:  "input.css",
-	}
-	engine, err := gossr.New(*engineConfig)
-
-    if err != nil {
-        t.Fatal(err)
-    }
-
-    api.SetupRouter(router, engine)
+    api.SetupRouter(router)
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/ping", nil)

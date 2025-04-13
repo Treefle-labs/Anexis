@@ -9,7 +9,6 @@ import (
 	"cloudbeast.doni/m/utils"
 	"github.com/Backblaze/blazer/b2"
 	"github.com/gin-gonic/gin"
-	gossr "github.com/natewong1313/go-react-ssr"
 	"github.com/joho/godotenv"
 	"github.com/gin-contrib/pprof"
 )
@@ -37,21 +36,9 @@ func main() {
 	println(buckets)
 	router := gin.Default()
 	pprof.Register(router)
-	engineConfig := &gossr.Config{
-		AssetRoute:         "/static",
-		FrontendDir:        "./frontend/src",
-		GeneratedTypesPath: "./frontend/src/generated.d.ts",
-		PropsStructsPath:   "./models/props.go",
-		TailwindConfigPath: "./tailwind.config.js",
-		LayoutCSSFilePath:  "input.css",
-	}
-	engine, enginErr := gossr.New(*engineConfig)
-	if enginErr != nil {
-		log.Fatal(enginErr)
-	}
 	router.StaticFS("/static", gin.Dir("../client", false))
 	router.StaticFile("favicon.ico", "./client/ico.svg")
-	api.SetupRouter(router, engine)
+	api.SetupRouter(router)
 
 	err = router.Run(":8080") // Utilisation du port 8080 pour HTTP
 	if err != nil {
