@@ -31,16 +31,14 @@ func createImportPlugin() api.Plugin {
 					ReplaceAllString(string(content), `from $1$2.js$1`)
 
 				return api.OnLoadResult{
-					Contents:   &updatedContent, // Contenu modifié
-					Loader:     api.LoaderTS,    // Garder le loader TypeScript
+					Contents:   &updatedContent,         // Contenu modifié
+					Loader:     api.LoaderTS,            // Garder le loader TypeScript
 					ResolveDir: filepath.Dir(args.Path), // Répertoire pour la résolution
 				}, nil
 			})
 		},
 	}
 }
-
-
 
 func buildTSFile(inputPath string) error {
 	outputPath := filepath.Join(
@@ -119,7 +117,7 @@ func WatchTSFiles(sourceDir string) error {
 		Sourcemap:   api.SourceMapLinked,
 		Outdir:      "./client/js",
 		Platform:    api.PlatformBrowser,
-		Plugins: []api.Plugin{createImportPlugin()},
+		Plugins:     []api.Plugin{createImportPlugin()},
 		Loader: map[string]api.Loader{
 			".ts": api.LoaderTS, // Indiquer à esbuild de gérer les fichiers TypeScript
 		},

@@ -13,7 +13,7 @@ import (
 func TestPingRoute(t *testing.T) {
 	router := gin.Default()
 
-    api.SetupRouter(router)
+	api.SetupRouter(router)
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/ping", nil)

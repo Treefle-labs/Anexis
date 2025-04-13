@@ -8,9 +8,9 @@ import (
 	"cloudbeast.doni/m/api"
 	"cloudbeast.doni/m/utils"
 	"github.com/Backblaze/blazer/b2"
+	"github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
-	"github.com/gin-contrib/pprof"
 )
 
 func main() {

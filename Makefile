@@ -52,6 +52,10 @@ env:
 	@echo "Listing environment variables..."
 	env
 
+lint:
+	@echo "Running the linter... Good luck! 😃"
+	golangci-lint run --fix
+
 # Installation des dépendances
 install-deps:
 	@echo "Installing dependencies..."

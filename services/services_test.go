@@ -9,8 +9,8 @@ import (
 )
 
 const (
-    FILE = "../tests/input/gojo.jpeg"
-    OUTPUTDIR = "../tests/output"
+	FILE      = "../tests/input/gojo.jpeg"
+	OUTPUTDIR = "../tests/output"
 )
 
 func TestCompressionService(t *testing.T) {
@@ -23,14 +23,19 @@ func TestCompressionService(t *testing.T) {
 	if compressErr != nil {
 		t.Error("failed to compress data...")
 	}
-    outputFile, outputErr := os.Create(path.Join(OUTPUTDIR, "output"))
-    if outputErr != nil {
-        t.Errorf("cannot create a file with %s to the %s dir", path.Join(OUTPUTDIR, "output"), OUTPUTDIR)
-    }
-    outputFile.Write(compressedData)
+
+	outputFile, outputErr := os.Create(path.Join(OUTPUTDIR, "output"))
+	if outputErr != nil {
+		t.Errorf(
+			"cannot create a file with %s to the %s dir",
+			path.Join(OUTPUTDIR, "output"),
+			OUTPUTDIR,
+		)
+	}
+
+	outputFile.Write(compressedData)
 	outputFile.Close()
 }
-
 
 func TestDecompressionService(t *testing.T) {
 	data, err := os.ReadFile(path.Join(OUTPUTDIR, "output"))
@@ -43,7 +48,11 @@ func TestDecompressionService(t *testing.T) {
 	}
 	outputFile, outputErr := os.Create(path.Join(OUTPUTDIR, "output2.jpeg"))
 	if outputErr != nil {
-		t.Errorf("cannot create a file with %s to the %s dir", path.Join(OUTPUTDIR, "output2"), OUTPUTDIR)
+		t.Errorf(
+			"cannot create a file with %s to the %s dir",
+			path.Join(OUTPUTDIR, "output2"),
+			OUTPUTDIR,
+		)
 	}
 	outputFile.Write(decompressedData)
 	outputFile.Close()

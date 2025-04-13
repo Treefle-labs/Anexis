@@ -2,8 +2,6 @@ module cloudbeast.doni/m
 
 go 1.23.5
 
-toolchain go1.22.9
-
 require (
 	ariga.io/atlas-provider-gorm v0.5.0
 	github.com/docker/docker v27.4.1+incompatible

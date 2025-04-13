@@ -8,6 +8,7 @@ import (
 )
 
 var privateKey *rsa.PrivateKey
+
 const USER = "doni"
 
 func TestGenerator(t *testing.T) {

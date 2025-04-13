@@ -11,45 +11,54 @@ import (
 )
 
 type Claims struct {
-    UserId int `json:"userId"`
-    jwt.StandardClaims
+	UserId int `json:"userId"`
+	jwt.StandardClaims
 }
 
 var JwtKey = []byte("your_secret_key") // Remplace par une clé secrète sécurisée
 
 func GenerateToken(c *gin.Context) {
-    dbx, err := db.Setup()
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"message": "Some features not initialize properly"})
-    }
-    userID, ok := c.Get("userID")
-    var user models.User
-    if !ok {
-        c.JSON(http.StatusUnauthorized, gin.H{"message": "User not authenticated"})
-        return
-    }
+	dbx, err := db.Setup()
+	if err != nil {
+		c.JSON(
+			http.StatusInternalServerError,
+			gin.H{"message": "Some features not initialize properly"},
+		)
+	}
 
-    result := dbx.First(&user, userID.(int))
+	userID, ok := c.Get("userID")
 
-    if result.Error != nil {
-        c.JSON(http.StatusNotFound, gin.H{"message": "not found user"})
-        return
-    }
+	var user models.User
 
-    claims := &Claims{
-        UserId: userID.(int),
-        StandardClaims: jwt.StandardClaims{
-            ExpiresAt: time.Now().Add(time.Hour * 24).Unix(), // Token expirera dans 24 heures
-        },
-    }
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": "User not authenticated"})
 
-    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-    tokenString, err := token.SignedString(JwtKey)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"message": "Could not create token"})
-        return
-    }
+		return
+	}
 
-    c.JSON(http.StatusOK, gin.H{"token": tokenString})
+	result := dbx.First(&user, userID.(int))
+
+	if result.Error != nil {
+		c.JSON(http.StatusNotFound, gin.H{"message": "not found user"})
+
+		return
+	}
+
+	claims := &Claims{
+		UserId: userID.(int),
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: time.Now().Add(time.Hour * 24).Unix(), // Token expirera dans 24 heures
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	tokenString, err := token.SignedString(JwtKey)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Could not create token"})
+
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"token": tokenString})
 }
-
