@@ -5,7 +5,7 @@ import (
 	"path"
 	"testing"
 
-	"cloudbeast.doni/m/services"
+	"anexis/services"
 )
 
 const (

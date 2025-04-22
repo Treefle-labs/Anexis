@@ -3,9 +3,9 @@ package api
 import (
 	"log"
 
-	"cloudbeast.doni/m/controllers"
-	"cloudbeast.doni/m/middleware"
-	"cloudbeast.doni/m/routes"
+	"anexis/server/controllers"
+	"anexis/server/middleware"
+	"anexis/server/routes"
 	"github.com/gin-gonic/gin"
 )
 

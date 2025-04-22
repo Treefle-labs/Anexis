@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"time"
 
-	"cloudbeast.doni/m/db"
-	"cloudbeast.doni/m/models"
+	"anexis/server/db"
+	"anexis/server/models"
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
 )

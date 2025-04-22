@@ -6,7 +6,7 @@ import (
 	"os"
 
 	"ariga.io/atlas-provider-gorm/gormschema"
-	"cloudbeast.doni/m/models"
+	"anexis/server/models"
 )
 
 func main() {

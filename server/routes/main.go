@@ -1,7 +1,7 @@
 package routes
 
 import (
-	"cloudbeast.doni/m/models"
+	"anexis/server/models"
 	"github.com/gin-gonic/gin"
 	gossr "github.com/natewong1313/go-react-ssr"
 )

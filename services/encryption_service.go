@@ -14,7 +14,8 @@ func EncryptFile(fileData []byte, pubKey *rsa.PublicKey) ([]byte, error) {
 }
 
 func SaveEncryptedFile(filename string, data []byte) error {
-	return os.WriteFile("/path/to/storage/"+filename, data, 0o644)
+	storagePath := "/path"
+	return os.WriteFile(storagePath+filename, data, 0o644)
 }
 
 func DecryptFile(cipherData []byte, privKey *rsa.PrivateKey) ([]byte, error) {

@@ -3,7 +3,7 @@ package middleware
 import (
 	"net/http"
 
-	"cloudbeast.doni/m/controllers"
+	"anexis/server/controllers"
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
 )

@@ -5,8 +5,9 @@ import (
 	"log"
 	"os"
 
-	"cloudbeast.doni/m/api"
-	"cloudbeast.doni/m/utils"
+	"anexis/server/api"
+	"anexis/utils"
+
 	"github.com/Backblaze/blazer/b2"
 	"github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"

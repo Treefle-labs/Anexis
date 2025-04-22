@@ -4,7 +4,7 @@ import (
 	"crypto/rsa"
 	"testing"
 
-	"cloudbeast.doni/m/utils"
+	"anexis/utils"
 )
 
 var privateKey *rsa.PrivateKey
