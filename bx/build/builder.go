@@ -2,80 +2,161 @@ package build
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	// Go-Git imports
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/go-git/go-git/v5"
+	gitconfig "github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/transport"
+	"github.com/joho/godotenv" // for the .env files loading
+	"github.com/moby/go-archive"
+	"github.com/moby/term"
 	"gopkg.in/yaml.v3"
 
-	// Paquet pour B2
+	// mod for B2
 	"github.com/Backblaze/blazer/b2"
 )
 
-// BuildSpec représente la configuration personnalisée de build
+// --- Struct Definitions ---
+
+// BuildSpec is the specification structure parsing from the spec file
+// This is the extended config for the build process
 type BuildSpec struct {
-	Name        string            `json:"name" yaml:"name"`
-	Version     string            `json:"version" yaml:"version"`
-	Codebases   []CodebaseConfig  `json:"codebases" yaml:"codebases"`
-	BuildConfig BuildConfig       `json:"build_config" yaml:"build_config"`
-	Env         map[string]string `json:"env" yaml:"env"`
-	Artifacts   []string          `json:"artifacts" yaml:"artifacts"`
+	Name         string            `json:"name" yaml:"name"`                                         // The Name used for the service
+	Version      string            `json:"version" yaml:"version"`                                   // The version of the software can use a semver specification
+	Codebases    []CodebaseConfig  `json:"codebases" yaml:"codebases"`                               // The list of the different codebases. It can be provided by git or local or tar/zip archive
+	Resources    []ResourceConfig  `json:"resources,omitempty" yaml:"resources,omitempty"`           // A list of the resources to include in build process
+	BuildSteps   []BuildStep       `json:"build_steps,omitempty" yaml:"build_steps,omitempty"`       // Specify the different build step. Useful for including a binary dependency in any codebase build
+	BuildConfig  BuildConfig       `json:"build_config" yaml:"build_config"`                         // The build Build configuration struct
+	Env          map[string]string `json:"env,omitempty" yaml:"env,omitempty"`                       // Specify the Environment variables
+	EnvFiles     []string          `json:"env_files,omitempty" yaml:"env_files,omitempty"`           // Used to load the Envs from the provided file path
+	Secrets      []SecretSpec      `json:"secrets,omitempty" yaml:"secrets,omitempty"`               // Secrets specifications. Secrets is like env vars but it's provided by a specific service and encrypted/decrypted during the usage. Use this to pass very sensible information to your different services
+	RunConfigDef RunConfigDef      `json:"run_config_def,omitempty" yaml:"run_config_def,omitempty"` // Configuration for the *.run.yml file. This file is used by the CLI to run your different services
 }
 
-// CodebaseConfig représente une base de code source
+// Representation of any codebase in the services
 type CodebaseConfig struct {
-	Name       string `json:"name" yaml:"name"`
-	SourceType string `json:"source_type" yaml:"source_type"` // git, local, archive, buffer
-	Source     string `json:"source" yaml:"source"`           // URL, chemin local
-	Branch     string `json:"branch" yaml:"branch"`
-	Commit     string `json:"commit" yaml:"commit"`
-	Path       string `json:"path" yaml:"path"` // Sous-répertoire si nécessaire
-	Content    []byte `json:"-" yaml:"-"`       // Contenu en mémoire pour le type buffer
+	Name         string `json:"name" yaml:"name"`                                         // Specify the name of the codebase
+	SourceType   string `json:"source_type" yaml:"source_type"`                           // git, local, archive, buffer
+	Source       string `json:"source" yaml:"source"`                                     // URL, local path
+	Branch       string `json:"branch,omitempty" yaml:"branch,omitempty"`                 // The git branch to build
+	Commit       string `json:"commit,omitempty" yaml:"commit,omitempty"`                 // The specific commit to consider during the codebase pulling if the source is git
+	Path         string `json:"path,omitempty" yaml:"path,omitempty"`                     // The path of the codebase in the local dir
+	Content      []byte `json:"-" yaml:"-"`                                               // The memory content if the source type is buffer
+	BuildOnly    bool   `json:"build_only,omitempty" yaml:"build_only,omitempty"`         // If specified the codebase is only builded
+	TargetInHost string `json:"target_in_host,omitempty" yaml:"target_in_host,omitempty"` // Path to put the codebase in the host dir
 }
 
-// BuildConfig représente la configuration de build Docker
+// ResourceConfig is resource representation to download during the build
+type ResourceConfig struct {
+	URL        string `json:"url" yaml:"url"`                             // The resource URL
+	TargetPath string `json:"target_path" yaml:"target_path"`             // relative path destination in the build dir
+	Extract    bool   `json:"extract,omitempty" yaml:"extract,omitempty"` // Extract the archive (tar, tgz, zip)
+}
+
+// BuildStep is a build sequenced step, potentially with dependencies
+type BuildStep struct {
+	Name              string `json:"name" yaml:"name"`                                                     // The step name
+	CodebaseName      string `json:"codebase_name" yaml:"codebase_name"`                                   // References a codebase name to use for this step
+	OutputsBinaryPath string `json:"outputs_binary_path,omitempty" yaml:"outputs_binary_path,omitempty"`   // Path in the *container* of the binary to extract
+	UseBinaryFromStep string `json:"use_binary_from_step,omitempty" yaml:"use_binary_from_step,omitempty"` // The step in which the binary will be used
+	BinaryTargetPath  string `json:"binary_target_path,omitempty" yaml:"binary_target_path,omitempty"`     // The path to put the binary during the specific step
+}
+
+// BuildConfig is a Docker build config spec extended
 type BuildConfig struct {
-	BaseImage   string            `json:"base_image" yaml:"base_image"`
-	Dockerfile  string            `json:"dockerfile" yaml:"dockerfile"`
-	ComposeFile string            `json:"compose_file" yaml:"compose_file"`
-	Target      string            `json:"target" yaml:"target"`
-	Args        map[string]string `json:"args" yaml:"args"`
-	Tags        []string          `json:"tags" yaml:"tags"`
-	Platforms   []string          `json:"platforms" yaml:"platforms"`
-	NoCache     bool              `json:"no_cache" yaml:"no_cache"`
+	BaseImage    string            `json:"base_image,omitempty" yaml:"base_image,omitempty"`     // The base image to use
+	Dockerfile   string            `json:"dockerfile,omitempty" yaml:"dockerfile,omitempty"`     // relative path of the Dockerfile or the inline content
+	ComposeFile  string            `json:"compose_file,omitempty" yaml:"compose_file,omitempty"` // the relative compose file path
+	Target       string            `json:"target,omitempty" yaml:"target,omitempty"`
+	Args         map[string]string `json:"args,omitempty" yaml:"args,omitempty"`             // Ens vars to inject in the build config
+	Tags         []string          `json:"tags,omitempty" yaml:"tags,omitempty"`             // Tags for the finale docker image (or the principal image in case of compose)
+	Platforms    []string          `json:"platforms,omitempty" yaml:"platforms,omitempty"`   // cross-platform support (experimental)
+	NoCache      bool              `json:"no_cache,omitempty" yaml:"no_cache,omitempty"`     // Specify if the cache will be used between the build
+	OutputTarget string            `json:"output_target" yaml:"output_target"`               // The storage target "b2", "local", "docker" (by default)
+	LocalPath    string            `json:"local_path,omitempty" yaml:"local_path,omitempty"` // Output path if OutputTarget="local"
+	Pull         bool              `json:"pull,omitempty" yaml:"pull,omitempty"`             // Trying to pull the based image
+	BuildKit     bool              `json:"buildkit,omitempty" yaml:"buildkit,omitempty"`     // Use BuildKit (if available)
 }
 
-// BuildResult contient les résultats du processus de build
+// SecretSpec define the way to fetch the secrets
+type SecretSpec struct {
+	Name         string `json:"name" yaml:"name"`                   // The name of the env var that will receive the secret
+	Source       string `json:"source" yaml:"source"`               // The service ID for this secret
+	InjectMethod string `json:"inject_method" yaml:"inject_method"` // "env" (default), can be file later
+}
+
+// RunConfigDef define the parameters for the *.run.yml generation
+type RunConfigDef struct {
+	Generate        bool     `json:"generate" yaml:"generate"`                     // Is the file will be generated ?
+	ArtifactStorage string   `json:"artifact_storage" yaml:"artifact_storage"`     // "docker" (use the tags), "local" (referencing .tar)
+	Commands        []string `json:"commands,omitempty" yaml:"commands,omitempty"` // The default commands (overriding if needed)
+	// Some other options can be added after...
+}
+
+// RunService is any service representation in the *.run.yml
+type RunService struct {
+	Image       string            `yaml:"image"`                 // The name of the tar local image
+	Command     []string          `yaml:"command,omitempty"`     // The command to exec
+	Entrypoint  []string          `yaml:"entrypoint,omitempty"`  // The entry point
+	Environment map[string]string `yaml:"environment,omitempty"` // Environment variables (include secrets)
+	Ports       []string          `yaml:"ports,omitempty"`       // Format "host:container"
+	Volumes     []string          `yaml:"volumes,omitempty"`     // Format "host:container" ou "named:container"
+	Restart     string            `yaml:"restart,omitempty"`     // Reboot politic (e.g., "always", "on-failure")
+	DependsOn   []string          `yaml:"depends_on,omitempty"`  // The depending services
+	// Some other fields can be added later...
+}
+
+// RunYAML is the struct of the *.run.yml output file. This file is generated after a build and is used by the bx CLI to run your artifact
+type RunYAML struct {
+	Version  string                `yaml:"version"` // The file version format
+	Services map[string]RunService `yaml:"services"`
+	// potentially other sections for volumes, networks, etc.
+}
+
+// BuildResult is the struct representing a build result of each service
 type BuildResult struct {
-	Success       bool              `json:"success"`
-	ImageID       string            `json:"image_id"`
-	ImageSize     int64             `json:"image_size"`
-	Artifacts     map[string][]byte `json:"artifacts"`
-	BuildTime     float64           `json:"build_time"`
-	ErrorMessage  string            `json:"error_message,omitempty"`
-	Logs          string            `json:"logs"`
-	B2ObjectNames []string          `json:"b2_object_names,omitempty"`
+	Success         bool                     `json:"success"`
+	ImageID         string                   `json:"image_id,omitempty"`          // The docker image ID (if applicable)
+	ImageIDs        map[string]string        `json:"image_ids,omitempty"`         // Each service IDS (if compose)
+	ImageSize       int64                    `json:"image_size,omitempty"`        // The main docker image size
+	ImageSizes      map[string]int64         `json:"image_sizes,omitempty"`       // Image size by service
+	Artifacts       map[string][]byte        `json:"-"`                           // Memory artefact
+	BuildTime       float64                  `json:"build_time"`                  // Total Build time
+	ErrorMessage    string                   `json:"error_message,omitempty"`     // Build error message
+	Logs            string                   `json:"logs"`                        // Build logs
+	B2ObjectNames   []string                 `json:"b2_object_names,omitempty"`   // For OutputTarget="b2"
+	LocalImagePaths map[string]string        `json:"local_image_paths,omitempty"` // For OutputTarget="local"
+	RunConfigPath   string                   `json:"run_config_path,omitempty"`   // Path to the generated *.run.yml file
+	ServiceOutputs  map[string]ServiceOutput `json:"service_outputs,omitempty"`   // Specific information generated by service
 }
 
-// B2Config contient les informations de configuration pour le stockage B2
+// ServiceOutput is the specific information for each builded service (e.g., image ID)
+type ServiceOutput struct {
+	ImageID   string `json:"image_id"`
+	ImageSize int64  `json:"image_size"`
+	Logs      string `json:"logs"`
+}
+
+// B2Config is the b2 storage information struct
 type B2Config struct {
 	AccountID      string `json:"account_id" yaml:"account_id"`
 	ApplicationKey string `json:"application_key" yaml:"application_key"`
@@ -83,230 +164,951 @@ type B2Config struct {
 	BasePath       string `json:"base_path" yaml:"base_path"`
 }
 
-// BuildService est le service principal qui gère les builds
+// The Main service to manage each build
 type BuildService struct {
-	dockerClient *client.Client
-	workDir      string
-	b2Config     *B2Config
-	mutex        sync.Mutex
-	inMemory     bool // Si true, fonctionne principalement en mémoire
+	dockerClient  *client.Client
+	workDir       string
+	b2Config      *B2Config
+	mutex         sync.Mutex
+	inMemory      bool          // if true minimizing the system disk usage
+	secretFetcher SecretFetcher // Interface for secrets fetching
 }
 
-// NewBuildService crée une nouvelle instance du service de build
-func NewBuildService(workDir string, inMemory bool) (*BuildService, error) {
+type ComposeProject struct {
+	Version  string                    `yaml:"version,omitempty"`
+	Services map[string]ComposeService `yaml:"services"`
+	Name     string
+	Volumes  map[string]interface{} `yaml:"volumes,omitempty"`
+	Networks map[string]interface{} `yaml:"networks,omitempty"`
+}
+
+// A representation of a compose service (simplified)
+type ComposeService struct {
+	Image           string             `yaml:"image,omitempty"`
+	Build           *ComposeBuild      `yaml:"build,omitempty"`
+	Command         []string           `yaml:"command,omitempty"`
+	Entrypoint      []string           `yaml:"entrypoint,omitempty"`
+	Environment     map[string]*string `yaml:"environment,omitempty"`
+	Ports           []string           `yaml:"ports,omitempty"`
+	Volumes         []string           `yaml:"volumes,omitempty"`
+	DependsOn       []string           `yaml:"depends_on,omitempty"`
+	Restart         string             `yaml:"restart,omitempty"`
+	HealthCheck     *HealthCheck       `yaml:"healthcheck,omitempty"`
+	Labels          map[string]string  `yaml:"labels,omitempty"`
+	Expose          []string           `yaml:"expose,omitempty"`
+	StopGracePeriod string             `yaml:"stop_grace_period,omitempty"`
+}
+
+type ComposeBuild struct {
+	Context    string
+	Dockerfile string
+	Args       map[string]*string
+	Target     string
+	CacheFrom  []string          `yaml:"cache_from,omitempty"`
+	Labels     map[string]string `yaml:"labels,omitempty"`
+	Network    string            `yaml:"network,omitempty"`
+}
+
+// UnmarshalYAML handle the case which `build: ./context` and `build: {context: ...}`
+func (cb *ComposeBuild) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode { // Case build: ./context
+		cb.Context = value.Value
+		return nil
+	}
+	// Case build: { ... } (map)
+	// use a temp type to avoid the infinite recursion
+	type ComposeBuildMap struct {
+		Context    string             `yaml:"context,omitempty"`
+		Dockerfile string             `yaml:"dockerfile,omitempty"`
+		Args       map[string]*string `yaml:"args,omitempty"`
+		Target     string             `yaml:"target,omitempty"`
+		CacheFrom  []string           `yaml:"cache_from,omitempty"`
+		Labels     map[string]string  `yaml:"labels,omitempty"`
+		Network    string             `yaml:"network,omitempty"`
+	}
+	var temp ComposeBuildMap
+	if err := value.Decode(&temp); err != nil {
+		return err
+	}
+	cb.Context = temp.Context
+	cb.Dockerfile = temp.Dockerfile
+	cb.Args = temp.Args
+	cb.Target = temp.Target
+	cb.CacheFrom = temp.CacheFrom
+	cb.Labels = temp.Labels
+	cb.Network = temp.Network
+
+	// Apply the default if context is empty but build is a non empty map
+	if cb.Context == "" && !value.IsZero() && value.Kind == yaml.MappingNode {
+		cb.Context = "."
+	}
+	return nil
+}
+
+// This is a healthcheck simplified struct
+type HealthCheck struct {
+	Test        []string `yaml:"test,omitempty"`
+	Interval    string   `yaml:"interval,omitempty"`
+	Timeout     string   `yaml:"timeout,omitempty"`
+	Retries     *int     `yaml:"retries,omitempty"`
+	StartPeriod string   `yaml:"start_period,omitempty"`
+}
+
+// Interface for an extern secrets service provider
+type SecretFetcher interface {
+	GetSecret(ctx context.Context, source string) (string, error) // Must return the secret value
+}
+
+// --- Service Initialization ---
+
+// Create a new instance of the build service
+func NewBuildService(workDir string, inMemory bool, secretFetcher SecretFetcher) (*BuildService, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return nil, fmt.Errorf("erreur lors de la création du client Docker: %w", err)
+		return nil, fmt.Errorf("error during the Docker client initialization: %w", err)
 	}
 
-	// Création du répertoire de travail si nécessaire et si pas en mode mémoire
-	if !inMemory && workDir != "" {
+	// Creating the working directory
+	effectiveWorkDir := workDir
+	if inMemory && workDir == "" {
+		// Memory mode creating the working temp dir
+		tmpDir, err := os.MkdirTemp("", "buildservice-work-")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create the temp working dir: %w", err)
+		}
+		effectiveWorkDir = tmpDir
+		// TODO: Assuming that the program delete this temp dir
+	} else if !inMemory && workDir != "" {
 		if err := os.MkdirAll(workDir, 0755); err != nil {
-			return nil, fmt.Errorf("impossible de créer le répertoire %s: %w", workDir, err)
+			return nil, fmt.Errorf("working dir creation failed %s: %w", workDir, err)
 		}
 	}
 
 	return &BuildService{
-		dockerClient: cli,
-		workDir:      workDir,
-		inMemory:     inMemory,
-		mutex:        sync.Mutex{},
+		dockerClient:  cli,
+		workDir:       effectiveWorkDir,
+		inMemory:      inMemory,
+		secretFetcher: secretFetcher, // Inject the secret fetcher
+		mutex:         sync.Mutex{},
 	}, nil
 }
 
-// SetB2Config configure les paramètres pour le stockage B2
+func (s *BuildService) Cleanup() error {
+	if err := os.RemoveAll(s.workDir); err != nil {
+		return fmt.Errorf("failed to clean the working dir: %s %w", s.workDir, err)
+	}
+
+	return nil
+}
+
+// SetB2Config configure the B2 configuration
 func (s *BuildService) SetB2Config(config *B2Config) {
 	s.b2Config = config
 }
 
-// LoadBuildSpecFromFile charge une spécification de build depuis un fichier
+// --- Configuration Loading ---
+
+// Load the build config from a file
 func LoadBuildSpecFromFile(filename string) (*BuildSpec, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("impossible de lire le fichier de spécification: %w", err)
+		return nil, fmt.Errorf("cannot read the build file specification '%s': %w", filename, err)
 	}
-
 	return LoadBuildSpecFromBytes(data, filepath.Ext(filename))
 }
 
-// LoadBuildSpecFromBytes charge une spécification de build depuis des données en mémoire
+// Load the build config from byte array
 func LoadBuildSpecFromBytes(data []byte, format string) (*BuildSpec, error) {
 	var spec BuildSpec
 	var err error
+
+	// Set defaults
+	spec.BuildConfig.OutputTarget = "docker"     // Default output target
+	spec.RunConfigDef.Generate = true            // Default to generating run config
+	spec.RunConfigDef.ArtifactStorage = "docker" // Default artifact storage for run config
 
 	if format == ".json" {
 		err = json.Unmarshal(data, &spec)
 	} else if format == ".yaml" || format == ".yml" {
 		err = yaml.Unmarshal(data, &spec)
 	} else {
-		return nil, fmt.Errorf("format non pris en charge: %s", format)
+		// Try YAML decoding by default if format is unknown or missing
+		err = yaml.Unmarshal(data, &spec)
+		if err != nil {
+			// If YAML fails, try JSON as a fallback
+			errJson := json.Unmarshal(data, &spec)
+			if errJson != nil {
+				return nil, fmt.Errorf("invalid format. YAML error: %v, JSON error: %v", err, errJson)
+			}
+			err = nil // JSON succeeded
+		}
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("impossible de parser la spécification: %w", err)
+		return nil, fmt.Errorf("specification parsing failed (format: %s): %w", format, err)
+	}
+
+	// Basic Validation
+	if spec.Name == "" || spec.Version == "" {
+		return nil, fmt.Errorf("the fields 'name' and 'version' are required in the specification")
+	}
+	if len(spec.Codebases) == 0 && len(spec.BuildSteps) == 0 && spec.BuildConfig.Dockerfile == "" && spec.BuildConfig.ComposeFile == "" {
+		return nil, fmt.Errorf("no codebase, build_step, dockerfile or compose_file specified")
+	}
+	if spec.BuildConfig.Dockerfile != "" && spec.BuildConfig.ComposeFile != "" {
+		return nil, fmt.Errorf("don't specify 'dockerfile' et 'compose_file' in the build_config")
 	}
 
 	return &spec, nil
 }
 
-// Build exécute un build selon la spécification donnée
+// parse a compose file
+func LoadComposeFile(data []byte) (*ComposeProject, error) {
+	var project ComposeProject
+	err := yaml.Unmarshal(data, &project)
+	if err != nil {
+		return nil, fmt.Errorf("error during the compose YAML file parsing: %w", err)
+	}
+	if len(project.Services) == 0 {
+		return nil, fmt.Errorf("no service section found in the compose file config")
+	}
+	// Initializing the maps/slices nil to avoid the nil pointer panics
+	for _, service := range project.Services {
+		if service.Environment == nil {
+			service.Environment = make(map[string]*string)
+		}
+		if service.Build != nil && service.Build.Args == nil {
+			service.Build.Args = make(map[string]*string)
+		}
+		// TODO: do this for other map slice...
+	}
+	return &project, nil
+}
+
+func (s *BuildService) GetSecret(ctx context.Context, source string) (string, error) {
+	s.mutex.Lock()
+	fetcher := s.secretFetcher
+	defer s.mutex.Unlock()
+
+	if fetcher == nil {
+		// Using the default DummySecretFetcher if no fetcher is initialized
+		fetcher = &DummySecretFetcher{}
+	}
+	return fetcher.GetSecret(ctx, source)
+}
+
+// --- Core Build Logic ---
+
+// Running the build based on the provided spec
 func (s *BuildService) Build(ctx context.Context, spec *BuildSpec) (*BuildResult, error) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
 	startTime := time.Now()
 	result := &BuildResult{
-		Artifacts: make(map[string][]byte),
-		Logs:      "",
+		Artifacts:       make(map[string][]byte), // Legacy, might remove
+		Logs:            "",
+		ImageIDs:        make(map[string]string),
+		ImageSizes:      make(map[string]int64),
+		LocalImagePaths: make(map[string]string),
+		ServiceOutputs:  make(map[string]ServiceOutput),
 	}
+	var overallLogs strings.Builder // Collect logs from all steps
 
-	var buildDir string
-	var cleanupFunc func()
+	// --- 1. Setup Build Environment ---
+	buildID := fmt.Sprintf("%s-%s-%d", spec.Name, spec.Version, time.Now().UnixNano())
+	buildDir := filepath.Join(s.workDir, buildID) // Main directory for this build
 
-	if s.inMemory {
-		// Utilisation d'un répertoire temporaire pour les opérations nécessitant des fichiers
-		tmpDir, err := os.MkdirTemp("", fmt.Sprintf("docker-build-%s-%s-", spec.Name, spec.Version))
+	if err := os.MkdirAll(buildDir, 0755); err != nil {
+		result.Success = false
+		result.ErrorMessage = fmt.Sprintf("cannot create the build dir '%s': %v", buildDir, err)
+		return result, fmt.Errorf("error during the run: \n %s", result.ErrorMessage)
+	}
+	// Cleanup build directory unless OutputTarget is local and no path is specified
+	shouldCleanup := !(spec.BuildConfig.OutputTarget == "local" && spec.BuildConfig.LocalPath == "")
+	if shouldCleanup {
+		defer func() {
+			// Add some robustness: Check if buildDir still exists
+			if _, err := os.Stat(buildDir); err == nil || !os.IsNotExist(err) {
+				os.RemoveAll(buildDir)
+			}
+		}()
+	}
+	overallLogs.WriteString(fmt.Sprintf("Using build directory: %s\n", buildDir))
+
+	// --- 2. Load Environment Variables ---
+	mergedEnv := make(map[string]string)
+	// Load from EnvFiles first
+	for _, envFile := range spec.EnvFiles {
+		// Assume relative path to buildDir or potentially absolute path? Let's try relative first.
+		envFilePath := filepath.Join(buildDir, envFile) // Or maybe relative to spec file location? Needs clarification.
+		if _, err := os.Stat(envFilePath); os.IsNotExist(err) {
+			// If relative to buildDir doesn't exist, try absolute
+			envFilePath = envFile
+		}
+		envMap, err := godotenv.Read(envFilePath)
 		if err != nil {
-			return result, fmt.Errorf("impossible de créer un répertoire temporaire: %w", err)
-		}
-		buildDir = tmpDir
-		cleanupFunc = func() { os.RemoveAll(tmpDir) }
-	} else {
-		// Créer un répertoire de build unique dans le workDir
-		buildID := fmt.Sprintf("%s-%s-%d", spec.Name, spec.Version, time.Now().Unix())
-		buildDir = filepath.Join(s.workDir, buildID)
-		if err := os.MkdirAll(buildDir, 0755); err != nil {
-			return result, fmt.Errorf("impossible de créer le répertoire de build: %w", err)
-		}
-		cleanupFunc = func() { os.RemoveAll(buildDir) }
-	}
-	defer cleanupFunc()
-
-	// Traiter les codebases
-	for _, codebase := range spec.Codebases {
-		destDir := filepath.Join(buildDir, codebase.Name)
-		if err := s.fetchCodebase(ctx, codebase, destDir); err != nil {
-			result.Success = false
-			result.ErrorMessage = fmt.Sprintf("erreur lors de la récupération de la codebase %s: %s", codebase.Name, err)
-			return result, err
-		}
-	}
-
-	// Préparer le Dockerfile
-	dockerfilePath := ""
-	if spec.BuildConfig.Dockerfile != "" {
-		dockerfilePath = filepath.Join(buildDir, "Dockerfile")
-		if err := os.WriteFile(dockerfilePath, []byte(spec.BuildConfig.Dockerfile), 0644); err != nil {
-			result.Success = false
-			result.ErrorMessage = "erreur lors de la création du Dockerfile: " + err.Error()
-			return result, err
-		}
-	} else {
-		// Chercher un Dockerfile existant
-		for _, codebase := range spec.Codebases {
-			dfPath := filepath.Join(buildDir, codebase.Name, "Dockerfile")
-			if _, err := os.Stat(dfPath); err == nil {
-				dockerfilePath = dfPath
-				break
+			overallLogs.WriteString(fmt.Sprintf("Warning: cannot read env file '%s': %v\n", envFile, err))
+		} else {
+			for k, v := range envMap {
+				if _, exists := mergedEnv[k]; !exists { // Avoid overriding already set vars from earlier files
+					mergedEnv[k] = v
+				}
 			}
 		}
-		if dockerfilePath == "" {
+	}
+	// Override with spec.Env
+	for k, v := range spec.Env {
+		mergedEnv[k] = v
+	}
+	overallLogs.WriteString(fmt.Sprintf("Loaded %d environment variables\n", len(mergedEnv)))
+
+	// --- 3. Fetch Secrets (Placeholder) ---
+	runtimeSecrets := make(map[string]string) // Secrets for runtime (.run.yml)
+	if s.secretFetcher != nil && len(spec.Secrets) > 0 {
+		overallLogs.WriteString("Fetching secrets...\n")
+		for _, secretSpec := range spec.Secrets {
+			if secretSpec.InjectMethod == "" || secretSpec.InjectMethod == "env" {
+				secretValue, err := s.secretFetcher.GetSecret(ctx, secretSpec.Source)
+				if err != nil {
+					errMsg := fmt.Sprintf("error during the secret creation '%s' (source: %s): %v", secretSpec.Name, secretSpec.Source, err)
+					overallLogs.WriteString(errMsg + "\n")
+					result.Success = false
+					result.ErrorMessage = errMsg
+					result.Logs = overallLogs.String()
+					return result, fmt.Errorf("error during the run: \n %s", errMsg)
+				}
+				runtimeSecrets[secretSpec.Name] = secretValue
+				overallLogs.WriteString(fmt.Sprintf("Secret '%s' fetched successfully.\n", secretSpec.Name))
+			} else {
+				overallLogs.WriteString(fmt.Sprintf("Warning: Secret injection method '%s' for '%s' not yet supported.\n", secretSpec.InjectMethod, secretSpec.Name))
+			}
+		}
+	}
+
+	// Combine regular envs and secret envs for runtime config
+	finalRuntimeEnv := make(map[string]string)
+	for k, v := range mergedEnv {
+		finalRuntimeEnv[k] = v
+	}
+	for k, v := range runtimeSecrets {
+		finalRuntimeEnv[k] = v // Secrets override regular env if names clash
+	}
+
+	// --- 4. Download Resources ---
+	overallLogs.WriteString("Downloading resources...\n")
+	for _, res := range spec.Resources {
+		overallLogs.WriteString(fmt.Sprintf("Downloading %s to %s...\n", res.URL, res.TargetPath))
+		targetFullPath := filepath.Join(buildDir, res.TargetPath)
+		targetDir := filepath.Dir(targetFullPath)
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			errMsg := fmt.Sprintf("error during the resource target directory creation '%s': %v", targetFullPath, err)
 			result.Success = false
-			result.ErrorMessage = "aucun Dockerfile trouvé"
-			return result, fmt.Errorf("aucun Dockerfile trouvé")
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+
+		err := s.downloadFile(ctx, res.URL, targetFullPath)
+		if err != nil {
+			errMsg := fmt.Sprintf("error during the resource downloading '%s': %v", res.URL, err)
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+
+		if res.Extract {
+			overallLogs.WriteString(fmt.Sprintf("Extracting %s...\n", targetFullPath))
+			// Extract needs to place files inside targetDir, not create a new subdir named after the archive
+			err := s.extractArchive(targetFullPath, targetDir)
+			if err != nil {
+				errMsg := fmt.Sprintf("error during the archive extraction '%s': %v", targetFullPath, err)
+				// Log warning but continue? Or fail? Let's fail for now.
+				result.Success = false
+				result.ErrorMessage = errMsg
+				result.Logs = overallLogs.String()
+				return result, fmt.Errorf("error during the run: \n %s", errMsg)
+			}
+			// Optionally remove the archive after extraction
+			os.Remove(targetFullPath)
+			overallLogs.WriteString(fmt.Sprintf("Extracted %s successfully.\n", res.TargetPath))
 		}
 	}
 
-	// Construction de l'image Docker
-	imageID, logs, err := s.buildWithDocker(ctx, buildDir, dockerfilePath, spec)
-	result.Logs = logs
-	if err != nil {
-		result.Success = false
-		result.ErrorMessage = "erreur lors du build Docker: " + err.Error()
-		return result, err
-	}
-	result.ImageID = imageID
-
-	// Récupérer la taille de l'image
-	imageSize, err := s.getImageSize(ctx, imageID)
-	if err == nil {
-		result.ImageSize = imageSize
-	}
-
-	// Collecter les artefacts
-	for _, artifactPath := range spec.Artifacts {
-		fullPath := filepath.Join(buildDir, artifactPath)
-		data, err := os.ReadFile(fullPath)
-		if err != nil {
-			result.Logs += fmt.Sprintf("\nAvertissement: impossible de lire l'artefact %s: %s", artifactPath, err)
-			continue
-		}
-		result.Artifacts[artifactPath] = data
-	}
-
-	// Exporter l'image et l'envoyer au bucket B2 si configuré
-	if s.b2Config != nil {
-		objectNames, err := s.exportAndUploadImage(ctx, imageID, spec)
-		if err != nil {
-			result.Logs += fmt.Sprintf("\nAvertissement lors de l'export vers B2: %s", err)
+	// --- 5. Prepare Codebases ---
+	overallLogs.WriteString("Fetching codebases...\n")
+	codebaseMap := make(map[string]CodebaseConfig) // For easy lookup by name
+	for _, codebase := range spec.Codebases {
+		codebaseMap[codebase.Name] = codebase
+		var destDir string
+		// If TargetInHost is specified, place it there relative to buildDir
+		if codebase.TargetInHost != "" {
+			destDir = filepath.Join(buildDir, codebase.TargetInHost)
 		} else {
-			result.B2ObjectNames = objectNames
+			// Default: place it in a subdirectory named after the codebase
+			destDir = filepath.Join(buildDir, codebase.Name)
+		}
+
+		overallLogs.WriteString(fmt.Sprintf("Fetching codebase '%s' (%s: %s) into %s\n", codebase.Name, codebase.SourceType, codebase.Source, destDir))
+		if err := s.fetchCodebase(ctx, codebase, destDir); err != nil {
+			errMsg := fmt.Sprintf("error during the codebase fetching '%s': %v", codebase.Name, err)
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
 		}
 	}
 
+	// --- 6. Execute Build Steps (Sequential Build & Binary Handling) ---
+	extractedBinaries := make(map[string][]byte) // Map step name -> binary data
+	overallLogs.WriteString("Executing build steps...\n")
+	for _, step := range spec.BuildSteps {
+		overallLogs.WriteString(fmt.Sprintf("--- Build Step: %s ---\n", step.Name))
+		cb, ok := codebaseMap[step.CodebaseName]
+		if !ok {
+			errMsg := fmt.Sprintf("build step '%s' referencing a non existent codebase: '%s'", step.Name, step.CodebaseName)
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+
+		stepBuildDir := filepath.Join(buildDir, cb.Name) // Assume codebase is in its named dir
+
+		// Inject binary from previous step if needed
+		if step.UseBinaryFromStep != "" {
+			binaryData, exists := extractedBinaries[step.UseBinaryFromStep]
+			if !exists {
+				errMsg := fmt.Sprintf("build step '%s' require a binary for the step '%s', but it's not found", step.Name, step.UseBinaryFromStep)
+				result.Success = false
+				result.ErrorMessage = errMsg
+				result.Logs = overallLogs.String()
+				return result, fmt.Errorf("error during the run: \n %s", errMsg)
+			}
+			if step.BinaryTargetPath == "" {
+				errMsg := fmt.Sprintf("build step '%s' uses a 'binary_target_path' not defined", step.Name)
+				result.Success = false
+				result.ErrorMessage = errMsg
+				result.Logs = overallLogs.String()
+				return result, fmt.Errorf("error during the run: \n %s", errMsg)
+			}
+
+			targetBinaryPath := filepath.Join(stepBuildDir, step.BinaryTargetPath)
+			targetBinaryDir := filepath.Dir(targetBinaryPath)
+			overallLogs.WriteString(fmt.Sprintf("Injecting binary from step '%s' to '%s'\n", step.UseBinaryFromStep, targetBinaryPath))
+			if err := os.MkdirAll(targetBinaryDir, 0755); err != nil {
+				errMsg := fmt.Sprintf("error during the repertory '%s' creation for the injected binary: %v", targetBinaryDir, err)
+				result.Success = false
+				result.ErrorMessage = errMsg
+				result.Logs = overallLogs.String()
+				return result, fmt.Errorf("error during the run: \n %s", errMsg)
+			}
+			if err := os.WriteFile(targetBinaryPath, binaryData, 0755); err != nil { // Make executable
+				errMsg := fmt.Sprintf("error during the binary writing '%s': %v", targetBinaryPath, err)
+				result.Success = false
+				result.ErrorMessage = errMsg
+				result.Logs = overallLogs.String()
+				return result, fmt.Errorf("error during the run: \n %s", errMsg)
+			}
+		}
+
+		// Build this step's codebase (assuming it has a Dockerfile)
+		// We need a way to find the Dockerfile for this specific step/codebase
+		stepDockerfilePath := filepath.Join(stepBuildDir, "Dockerfile") // Default assumption
+		// Allow overriding Dockerfile path via CodebaseConfig or BuildStep? For now, default.
+		if _, err := os.Stat(stepDockerfilePath); os.IsNotExist(err) {
+			errMsg := fmt.Sprintf("No Dockerfile founded '%s' in the build step '%s' (waiting path: %s)", cb.Name, step.Name, stepDockerfilePath)
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+
+		// Create a temporary BuildSpec for this step
+		stepSpec := &BuildSpec{
+			Name:    fmt.Sprintf("%s-%s-step-%s", spec.Name, spec.Version, step.Name),
+			Version: "latest",
+			BuildConfig: BuildConfig{
+				// Use build args from the main spec? Or step-specific? Let's use main spec for now.
+				Args:    spec.BuildConfig.Args,
+				NoCache: spec.BuildConfig.NoCache,
+				Tags:    []string{fmt.Sprintf("%s-%s-step-%s:latest", spec.Name, spec.Version, step.Name)}, // Temporary tag
+				Pull:    spec.BuildConfig.Pull,
+			},
+		}
+
+		// Build the image for the step
+		stepImageID, stepLogs, err := s.buildSingleImage(ctx, stepBuildDir, stepDockerfilePath, stepSpec)
+		overallLogs.WriteString(fmt.Sprintf("Logs for step %s:\n%s\n", step.Name, stepLogs))
+		if err != nil {
+			errMsg := fmt.Sprintf("error during the step build '%s': %v", step.Name, err)
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+		overallLogs.WriteString(fmt.Sprintf("Step '%s' built successfully, ImageID: %s\n", step.Name, stepImageID))
+
+		// Extract binary if needed
+		if step.OutputsBinaryPath != "" {
+			overallLogs.WriteString(fmt.Sprintf("Extracting binary '%s' from step '%s' image %s\n", step.OutputsBinaryPath, step.Name, stepImageID))
+			binaryData, err := s.extractFromContainer(ctx, stepImageID, step.OutputsBinaryPath)
+			if err != nil {
+				errMsg := fmt.Sprintf("erro during the extraction of the binary '%s' in the step '%s': %v", step.OutputsBinaryPath, step.Name, err)
+				result.Success = false
+				result.ErrorMessage = errMsg
+				result.Logs = overallLogs.String()
+				return result, fmt.Errorf("error during the run: \n %s", errMsg)
+			}
+			extractedBinaries[step.Name] = binaryData
+			overallLogs.WriteString(fmt.Sprintf("Binary extracted successfully (%d bytes).\n", len(binaryData)))
+		}
+		overallLogs.WriteString(fmt.Sprintf("--- End Build Step: %s ---\n", step.Name))
+	} // End of build steps loop
+
+	// --- 7. Main Build Execution ---
+	overallLogs.WriteString("--- Starting Main Build ---\n")
+
+	if spec.BuildConfig.ComposeFile != "" {
+		// --- 7a. Build using Docker Compose ---
+		overallLogs.WriteString(fmt.Sprintf("Building using Compose file: %s\n", spec.BuildConfig.ComposeFile))
+		composeFilePath := filepath.Join(buildDir, spec.BuildConfig.ComposeFile)
+		composeData, err := os.ReadFile(composeFilePath)
+		if err != nil {
+			errMsg := fmt.Sprintf("error during the compose file reading '%s': %v", composeFilePath, err)
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+
+		// Use the provided LoadComposeFile function (assuming it's adapted for compose-go v2)
+		composeProject, err := LoadComposeFile(composeData)
+		if err != nil {
+			errMsg := fmt.Sprintf("error during the compose file parsing '%s': %v", spec.BuildConfig.ComposeFile, err)
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+
+		buildErrs := s.buildComposeProject(ctx, buildDir, composeProject, spec, result, &overallLogs)
+		if len(buildErrs) > 0 {
+			errMsg := fmt.Sprintf("errors during the compose project building: %v", buildErrs)
+			result.Success = false
+			result.ErrorMessage = strings.Join(buildErrs, "; ")
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+		// Note: ImageID in result might remain empty if compose file only defines services with existing images
+		overallLogs.WriteString("Compose project built successfully.\n")
+
+	} else {
+		// --- 7b. Build using Dockerfile ---
+		dockerfilePath := ""
+		buildContextDir := buildDir // Default context is the root build directory
+
+		if spec.BuildConfig.Dockerfile != "" {
+			// Check if Dockerfile content is inline or a path
+			if strings.Contains(spec.BuildConfig.Dockerfile, "\n") {
+				// Inline Dockerfile content
+				dockerfilePath = filepath.Join(buildDir, "Dockerfile.inline")
+				if err := os.WriteFile(dockerfilePath, []byte(spec.BuildConfig.Dockerfile), 0644); err != nil {
+					errMsg := fmt.Sprintf("error during the inline Dockerfile creation: %v", err)
+					result.Success = false
+					result.ErrorMessage = errMsg
+					result.Logs = overallLogs.String()
+					return result, fmt.Errorf("error during the run: \n %s", errMsg)
+				}
+				overallLogs.WriteString("Using inline Dockerfile.\n")
+			} else {
+				// Path to Dockerfile relative to buildDir
+				dockerfilePath = filepath.Join(buildDir, spec.BuildConfig.Dockerfile)
+				// The build context might need adjustment if the Dockerfile is not at the root
+				buildContextDir = filepath.Dir(dockerfilePath)
+				overallLogs.WriteString(fmt.Sprintf("Using Dockerfile at path: %s\n", spec.BuildConfig.Dockerfile))
+			}
+		} else {
+			// Auto-detect Dockerfile (simple case: look for Dockerfile at the root)
+			dfPath := filepath.Join(buildDir, "Dockerfile")
+			if _, err := os.Stat(dfPath); err == nil {
+				dockerfilePath = dfPath
+				buildContextDir = buildDir
+				overallLogs.WriteString("Auto-detected Dockerfile at build root.\n")
+			} else {
+				// Try finding in the first codebase dir (legacy behavior, might need refinement)
+				if len(spec.Codebases) > 0 {
+					firstCodebaseDir := filepath.Join(buildDir, spec.Codebases[0].Name)
+					dfPath = filepath.Join(firstCodebaseDir, "Dockerfile")
+					if _, err := os.Stat(dfPath); err == nil {
+						dockerfilePath = dfPath
+						buildContextDir = firstCodebaseDir // Context is the codebase dir
+						overallLogs.WriteString(fmt.Sprintf("Auto-detected Dockerfile in first codebase: %s\n", spec.Codebases[0].Name))
+					}
+				}
+			}
+		}
+
+		if dockerfilePath == "" {
+			errMsg := "not found/provided Dockerfile for the build"
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+
+		// Perform the build for the single Dockerfile
+		imageID, logs, err := s.buildSingleImage(ctx, buildContextDir, dockerfilePath, spec)
+		overallLogs.WriteString(fmt.Sprintf("Dockerfile Build Logs:\n%s\n", logs))
+		if err != nil {
+			errMsg := fmt.Sprintf("erreur lors du build Docker: %v", err)
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+
+		// Store result for the single image build
+		result.ImageID = imageID
+		imageSize, err := s.getImageSize(ctx, imageID)
+		if err == nil {
+			result.ImageSize = imageSize
+		} else {
+			overallLogs.WriteString(fmt.Sprintf("Warning: could not get size for image %s: %v\n", imageID, err))
+		}
+		// Add to ServiceOutputs as a pseudo-service if needed for consistency
+		mainServiceName := spec.Name // Use build name as service name
+		result.ServiceOutputs[mainServiceName] = ServiceOutput{
+			ImageID:   imageID,
+			ImageSize: imageSize,
+			Logs:      logs,
+		}
+		result.ImageIDs[mainServiceName] = imageID
+		result.ImageSizes[mainServiceName] = imageSize
+
+		overallLogs.WriteString(fmt.Sprintf("Dockerfile build successful. ImageID: %s, Size: %d\n", imageID, imageSize))
+	}
+
+	// --- 8. Handle Build Outputs (Save/Upload Images) ---
+	outputBasePath := buildDir // Default base for local output
+	if spec.BuildConfig.OutputTarget == "local" && spec.BuildConfig.LocalPath != "" {
+		outputBasePath = spec.BuildConfig.LocalPath
+		if err := os.MkdirAll(outputBasePath, 0755); err != nil {
+			errMsg := fmt.Sprintf("cannot create the output base directory '%s': %v", outputBasePath, err)
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+		overallLogs.WriteString(fmt.Sprintf("Using custom local output path: %s\n", outputBasePath))
+	}
+
+	finalImageTags := make(map[string][]string) // serviceName -> tags
+
+	// Collect image IDs and desired tags
+	if spec.BuildConfig.ComposeFile != "" {
+		// Get tags from the built compose services
+		for serviceName, serviceOutput := range result.ServiceOutputs {
+			// Generate default tag if none specific
+			defaultTag := fmt.Sprintf("%s_%s:latest", spec.Name, serviceName)
+			finalImageTags[serviceName] = []string{defaultTag} // Simple tagging for now
+			// We could potentially read custom tags from the compose file's build section
+			// Apply tags to the image
+			for _, tag := range finalImageTags[serviceName] {
+				if err := s.dockerClient.ImageTag(ctx, serviceOutput.ImageID, tag); err != nil {
+					overallLogs.WriteString(fmt.Sprintf("Warning: Failed to tag image %s for service %s with tag %s: %v\n", serviceOutput.ImageID, serviceName, tag, err))
+				} else {
+					overallLogs.WriteString(fmt.Sprintf("Tagged image %s for service %s with %s\n", serviceOutput.ImageID, serviceName, tag))
+				}
+			}
+		}
+	} else if result.ImageID != "" {
+		// Get tags from the main build config for the single image
+		mainServiceName := spec.Name
+		if len(spec.BuildConfig.Tags) > 0 {
+			finalImageTags[mainServiceName] = spec.BuildConfig.Tags
+		} else {
+			// Generate default tag
+			finalImageTags[mainServiceName] = []string{fmt.Sprintf("%s:%s", spec.Name, spec.Version)}
+		}
+		// Apply tags
+		for _, tag := range finalImageTags[mainServiceName] {
+			if err := s.dockerClient.ImageTag(ctx, result.ImageID, tag); err != nil {
+				overallLogs.WriteString(fmt.Sprintf("Warning: Failed to tag image %s with tag %s: %v\n", result.ImageID, tag, err))
+			} else {
+				overallLogs.WriteString(fmt.Sprintf("Tagged image %s with %s\n", result.ImageID, tag))
+			}
+		}
+	}
+
+	// Save or upload based on OutputTarget
+	overallLogs.WriteString(fmt.Sprintf("Handling build output target: %s\n", spec.BuildConfig.OutputTarget))
+	switch spec.BuildConfig.OutputTarget {
+	case "b2":
+		if s.b2Config == nil {
+			errMsg := "OutputTarget is 'b2' but no config is defined"
+			result.Success = false
+			result.ErrorMessage = errMsg
+			result.Logs = overallLogs.String()
+			return result, fmt.Errorf("error during the run: \n %s", errMsg)
+		}
+		for serviceName, serviceOutput := range result.ServiceOutputs {
+			tags := finalImageTags[serviceName] // Get the tags we just applied
+			overallLogs.WriteString(fmt.Sprintf("Exporting and uploading image for service '%s' (ID: %s) to B2...\n", serviceName, serviceOutput.ImageID))
+			// Adapt exportAndUploadImage to handle multiple tags per image
+			objectNames, err := s.exportAndUploadImage(ctx, serviceOutput.ImageID, serviceName, spec.Version, tags)
+			if err != nil {
+				overallLogs.WriteString(fmt.Sprintf("Warning: Failed to export/upload image for service '%s' to B2: %v\n", serviceName, err))
+				// Continue with other images? Or fail? Let's continue but log.
+			} else {
+				result.B2ObjectNames = append(result.B2ObjectNames, objectNames...)
+				overallLogs.WriteString(fmt.Sprintf("Service '%s' image uploaded to B2: %v\n", serviceName, objectNames))
+			}
+		}
+
+	case "local":
+		for serviceName, serviceOutput := range result.ServiceOutputs {
+			imageFileName := fmt.Sprintf("%s_%s.tar", spec.Name, serviceName) // Consistent naming
+			localImagePath := filepath.Join(outputBasePath, imageFileName)
+			overallLogs.WriteString(fmt.Sprintf("Saving image for service '%s' (ID: %s) locally to %s...\n", serviceName, serviceOutput.ImageID, localImagePath))
+
+			err := s.saveImageLocally(ctx, serviceOutput.ImageID, localImagePath)
+			if err != nil {
+				errMsg := fmt.Sprintf("error during the service image saving locally '%s': %v", serviceName, err)
+				result.Success = false
+				result.ErrorMessage = errMsg
+				result.Logs = overallLogs.String()
+				return result, fmt.Errorf("error during the run: \n %s", errMsg)
+			}
+			result.LocalImagePaths[serviceName] = localImagePath
+			overallLogs.WriteString(fmt.Sprintf("Service '%s' image saved successfully.\n", serviceName))
+		}
+	case "docker":
+		// Images are already in the local Docker daemon, tagged. Nothing more to do here.
+		overallLogs.WriteString("Output target is 'docker', images are available in local daemon.\n")
+	default:
+		errMsg := fmt.Sprintf("OutputTarget not supported: %s", spec.BuildConfig.OutputTarget)
+		result.Success = false
+		result.ErrorMessage = errMsg
+		result.Logs = overallLogs.String()
+		return result, fmt.Errorf("error during the run: \n %s", errMsg)
+	}
+
+	// --- 9. Generate *.run.yml ---
+	if spec.RunConfigDef.Generate {
+		overallLogs.WriteString("Generating *.run.yml file...\n")
+		runConfigPath := filepath.Join(outputBasePath, fmt.Sprintf("%s-%s.run.yml", spec.Name, spec.Version))
+
+		// Loading the project if it's compose
+		var parsedComposeProject *ComposeProject // Using a simplified type
+		if spec.BuildConfig.ComposeFile != "" {
+			composeFilePath := filepath.Join(buildDir, spec.BuildConfig.ComposeFile) // Chemin dans le contexte de build temporaire
+			composeData, err := os.ReadFile(composeFilePath)
+			if err != nil {
+				overallLogs.WriteString(fmt.Sprintf("Warning: Failed to read compose file '%s' for run.yml generation: %v\n", composeFilePath, err))
+			} else {
+				parsedComposeProject, err = LoadComposeFile(composeData)
+				if err != nil {
+					overallLogs.WriteString(fmt.Sprintf("Warning: Failed to parse compose file for run.yml generation: %v\n", err))
+					parsedComposeProject = nil
+				}
+			}
+		}
+
+		runYAML, err := s.generateRunYAML(ctx, spec, result, finalRuntimeEnv, finalImageTags, parsedComposeProject)
+		if err != nil {
+			errMsg := fmt.Sprintf("error during the run.yml generating: %v", err)
+			overallLogs.WriteString(fmt.Sprintf("Warning: %s\n", errMsg))
+		} else if runYAML != nil && len(runYAML.Services) > 0 {
+			yamlData, err := yaml.Marshal(runYAML)
+			if err != nil {
+				overallLogs.WriteString(fmt.Sprintf("Warning: Failed to parse run file for run.yml generation: %v\n", err))
+			}
+			os.WriteFile(runConfigPath, yamlData, 0755)
+		} else {
+			overallLogs.WriteString("Skipping writing run.yml as no services were generated.\n")
+		}
+	}
+
+	// --- 10. Finalize ---
 	result.Success = true
 	result.BuildTime = time.Since(startTime).Seconds()
+	result.Logs = overallLogs.String() // Assign collected logs
+
+	// Clean up temporary build step images (optional)
+	// Could add logic here to remove images tagged like *-step-*
+
+	overallLogs.WriteString(fmt.Sprintf("Build finished successfully in %.2f seconds.\n", result.BuildTime))
+
 	return result, nil
 }
 
-// fetchCodebase récupère une codebase selon sa configuration
+// --- Helper Functions ---
+
+// fetching codebase from the provided source type and config
 func (s *BuildService) fetchCodebase(ctx context.Context, config CodebaseConfig, destDir string) error {
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		return err
+	// Ensure the parent directory exists, but destDir itself should not exist for git clone
+	parentDir := filepath.Dir(destDir)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("cannot create the parent directory '%s': %w", parentDir, err)
 	}
 
 	switch config.SourceType {
 	case "git":
-		return s.fetchGitRepo(ctx, config, destDir)
+		// Remove destination dir if it exists before cloning
+		if _, err := os.Stat(destDir); err == nil {
+			if err := os.RemoveAll(destDir); err != nil {
+				return fmt.Errorf("cannot clean the destination dir for repository fetching '%s': %w", destDir, err)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("error during the verification of the destination directory '%s': %w", destDir, err)
+		}
+		return s.fetchGitRepoWithGoGit(ctx, config, destDir)
 	case "local":
+		// copyLocalDir expects destDir to exist
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			return fmt.Errorf("cannot create the destination dir '%s' for the local copy: %w", destDir, err)
+		}
 		return s.copyLocalDir(config.Source, destDir)
 	case "archive":
+		// extractArchive expects destDir to exist
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			return fmt.Errorf("cannot create the destination dir '%s' for the archive: %w", destDir, err)
+		}
 		return s.extractArchive(config.Source, destDir)
 	case "buffer":
-		// Traitement des données directement en mémoire
 		if len(config.Content) == 0 {
-			return fmt.Errorf("contenu vide pour la codebase de type buffer")
+			return fmt.Errorf("empty content for the buffer codebase type '%s'", config.Name)
+		}
+		// extractBufferToDir expects destDir to exist
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			return fmt.Errorf("cannot create the destination dir '%s' for the buffer: %w", destDir, err)
 		}
 		return s.extractBufferToDir(config.Content, destDir)
 	default:
-		return fmt.Errorf("type de source non pris en charge: %s", config.SourceType)
+		return fmt.Errorf("this source type is not implemented yet '%s' for the codebase '%s'", config.SourceType, config.Name)
 	}
 }
 
-// fetchGitRepo clone un dépôt git
-func (s *BuildService) fetchGitRepo(ctx context.Context, config CodebaseConfig, destDir string) error {
-	// Utiliser gitImplementation directe si disponible, sinon utiliser exec.Command
-	// Ceci est un exemple simplifié qui utilise exec.Command
+// cloning repository using the go-git API
+func (s *BuildService) fetchGitRepoWithGoGit(ctx context.Context, config CodebaseConfig, destDir string) error {
+	options := &git.CloneOptions{
+		URL:               config.Source,
+		Progress:          os.Stdout,
+		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+		Auth:              nil, // TODO: Implement authentication
+		RemoteName:        "origin",
+		Depth:             0, // Clone full history by default
+	}
 
-	cmd := fmt.Sprintf("git clone")
 	if config.Branch != "" {
-		cmd += fmt.Sprintf(" -b %s", config.Branch)
+		options.ReferenceName = plumbing.NewBranchReferenceName(config.Branch)
+		options.SingleBranch = true
+		options.Depth = 1
 	}
+
+	parentDir := filepath.Dir(destDir)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("cannot create the parent dir '%s': %w", parentDir, err)
+	}
+	if _, err := os.Stat(destDir); err == nil {
+		fmt.Printf("Removing existing directory before clone: %s\n", destDir)
+		if err := os.RemoveAll(destDir); err != nil {
+			return fmt.Errorf("failed to remove the dest dir before cloning the repository '%s': %w", destDir, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("error during the dest repertory verification '%s': %w", destDir, err)
+	}
+
+	fmt.Printf("Cloning repository %s to %s...\n", config.Source, destDir)
+	repo, err := git.PlainCloneContext(ctx, destDir, false, options)
+	if err != nil {
+		// Handle specific errors
+		if err == transport.ErrAuthenticationRequired {
+			return fmt.Errorf("authentication require for the codebase fetching '%s'. configure an auth provider (SSH key, token HTTPS)", config.Source)
+		}
+		if strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("the repertory '%s' already existing (post verification error): %w", destDir, err)
+		}
+		return fmt.Errorf("error during the repository cloning '%s' (branch: %s): %w", config.Source, config.Branch, err)
+	}
+	fmt.Printf("Repository cloned successfully.\n")
+
+	// If a specific commit is requested, check it out
 	if config.Commit != "" {
-		cmd += " --single-branch"
+		fmt.Printf("Attempting to checkout commit %s...\n", config.Commit)
+		w, err := repo.Worktree()
+		if err != nil {
+			return fmt.Errorf("cannot get the repository work tree '%s' after cloning: %w", config.Source, err)
+		}
+
+		commitHash := plumbing.NewHash(config.Commit)
+		checkoutOptions := &git.CheckoutOptions{
+			Hash:  commitHash,
+			Force: true, // Force checkout
+		}
+
+		err = w.Checkout(checkoutOptions)
+		if err != nil {
+			fmt.Printf("Initial checkout failed for commit %s (%v), attempting fetch...\n", config.Commit, err)
+			// Try fetching explicitly, making sure to fetch all heads and tags
+			// which should bring in the necessary commit object if it exists remotely.
+			fetchOpts := &git.FetchOptions{
+				RefSpecs: []gitconfig.RefSpec{
+					// Fetch all branches from the remote into remote-tracking branches
+					gitconfig.RefSpec("+refs/heads/*:refs/remotes/origin/*"),
+					// Fetch all tags
+					gitconfig.RefSpec("+refs/tags/*:refs/tags/*"),
+				},
+				Auth:     options.Auth, // Reuse auth method from clone options
+				Progress: os.Stdout,    // Show progress
+				// Depth: 0, // Ensure full fetch if depth was used in clone? Or rely on default fetch behavior.
+			}
+
+			errFetch := repo.FetchContext(ctx, fetchOpts)
+			// git.NoErrAlreadyUpToDate is expected if the commit was already there but checkout failed for other reasons
+			if errFetch != nil && errFetch != git.NoErrAlreadyUpToDate {
+				// Log the fetch error, but the primary error is still the checkout failure if retry also fails.
+				fmt.Printf("Fetch failed: %v\n", errFetch)
+				// Return combined error information
+				return fmt.Errorf("error during the checkout of the commit '%s' (%w) and fetch also failed (%v)", config.Commit, err, errFetch)
+			} else if errFetch == git.NoErrAlreadyUpToDate {
+				fmt.Println("Fetch reported remote is already up-to-date.")
+			} else {
+				fmt.Println("Fetch completed successfully.")
+			}
+
+			// Retry checkout after fetch
+			fmt.Printf("Retrying checkout of commit %s after fetch...\n", config.Commit)
+			err = w.Checkout(checkoutOptions)
+			if err != nil {
+				// If it still fails after fetch, the commit might be invalid or unreachable
+				return fmt.Errorf("error during the checkout of the commit '%s' (after fetch): %w", config.Commit, err)
+			}
+		}
+		fmt.Printf("Successfully checked out commit %s\n", config.Commit)
 	}
-	cmd += fmt.Sprintf(" %s %s", config.Source, destDir)
 
-	// Exécuter la commande git
-	// Note: Dans une implémentation réelle, il serait préférable d'utiliser un client Git en Go
-	// comme go-git ou d'intégrer libgit2 via cgo pour éviter les dépendances externes
-
-	return execCmd(ctx, cmd)
+	return nil
 }
 
-// copyLocalDir copie un répertoire local
+// Used to copy a local dir/files with appropriate permissions
 func (s *BuildService) copyLocalDir(source, dest string) error {
-	entries, err := ioutil.ReadDir(source)
+	sourceInfo, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if !sourceInfo.IsDir() {
+		return fmt.Errorf("the source '%s' doesn't exist", source)
+	}
+
+	// Ensure dest directory exists with source permissions
+	if err := os.MkdirAll(dest, sourceInfo.Mode()); err != nil {
+		return err
+	}
+
+	entries, err := os.ReadDir(source)
 	if err != nil {
 		return err
 	}
@@ -315,19 +1117,32 @@ func (s *BuildService) copyLocalDir(source, dest string) error {
 		sourcePath := filepath.Join(source, entry.Name())
 		destPath := filepath.Join(dest, entry.Name())
 
+		fileInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+
 		if entry.IsDir() {
-			if err := os.MkdirAll(destPath, entry.Mode()); err != nil {
-				return err
-			}
+			// Recursively copy subdirectory
 			if err := s.copyLocalDir(sourcePath, destPath); err != nil {
 				return err
 			}
-		} else {
-			data, err := ioutil.ReadFile(sourcePath)
+		} else if fileInfo.Mode()&os.ModeSymlink != 0 {
+			// Handle symlinks (read link and recreate) - Optional, can be complex
+			link, err := os.Readlink(sourcePath)
 			if err != nil {
 				return err
 			}
-			if err := ioutil.WriteFile(destPath, data, entry.Mode()); err != nil {
+			if err := os.Symlink(link, destPath); err != nil {
+				return err
+			}
+		} else {
+			// Copy regular file content and permissions
+			data, err := os.ReadFile(sourcePath)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(destPath, data, fileInfo.Mode()); err != nil {
 				return err
 			}
 		}
@@ -335,1000 +1150,856 @@ func (s *BuildService) copyLocalDir(source, dest string) error {
 	return nil
 }
 
-// extractArchive extrait une archive vers un répertoire
+// Extract an archive (tar, tar.gz, zip) to a repertory
 func (s *BuildService) extractArchive(sourcePath string, destDir string) error {
-	data, err := ioutil.ReadFile(sourcePath)
+	file, err := os.Open(sourcePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot open the archive '%s': %w", sourcePath, err)
 	}
-	return s.extractBufferToDir(data, destDir)
-}
+	defer file.Close()
 
-// extractBufferToDir extrait des données d'archive en mémoire vers un répertoire
-func (s *BuildService) extractBufferToDir(data []byte, destDir string) error {
-	// Détecter le type d'archive et extraire
-	if bytes.HasPrefix(data, []byte{0x1F, 0x8B}) {
-		// Archive gzip (tar.gz)
-		gzr, err := gzip.NewReader(bytes.NewReader(data))
+	// Peek at the first few bytes to guess the format
+	header := make([]byte, 4)
+	_, err = file.ReadAt(header, 0)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("cannot read the archive header '%s': %w", sourcePath, err)
+	}
+	// Reset reader position
+	_, err = file.Seek(0, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("cannot reset the reading position in the archive '%s': %w", sourcePath, err)
+	}
+
+	if bytes.HasPrefix(header, []byte{0x1F, 0x8B}) {
+		// Gzip compressed (likely tar.gz)
+		gzr, err := gzip.NewReader(file)
 		if err != nil {
-			return err
+			return fmt.Errorf("error during the gzip reader creation for the archive '%s': %w", sourcePath, err)
 		}
 		defer gzr.Close()
+		return extractTar(tar.NewReader(gzr), destDir)
+	} else if bytes.HasPrefix(header, []byte{0x50, 0x4B, 0x03, 0x04}) {
+		// ZIP archive
+		// Need file size for zip reader
+		fileInfo, err := file.Stat()
+		if err != nil {
+			return fmt.Errorf("cannot get the zip file size '%s': %w", sourcePath, err)
+		}
+		return extractZip(file, fileInfo.Size(), destDir) // Implement extractZip
+	} else {
+		// Assume plain tar
+		return extractTar(tar.NewReader(file), destDir)
+	}
+}
 
+// Extract a buffer slice to a dir
+func (s *BuildService) extractBufferToDir(data []byte, destDir string) error {
+	dataReader := bytes.NewReader(data)
+
+	if bytes.HasPrefix(data, []byte{0x1F, 0x8B}) {
+		// Archive gzip (tar.gz)
+		gzr, err := gzip.NewReader(dataReader)
+		if err != nil {
+			return fmt.Errorf("error during the archive reading from the buffer: %w", err)
+		}
+		defer gzr.Close()
 		return extractTar(tar.NewReader(gzr), destDir)
 	} else if bytes.HasPrefix(data, []byte{0x50, 0x4B, 0x03, 0x04}) {
 		// Archive ZIP
-		// Note: Pour une implémentation complète, utilisez archive/zip
-		return fmt.Errorf("extraction ZIP non implémentée, utilisez tar.gz")
+		return extractZip(dataReader, int64(len(data)), destDir) // Implement extractZip for ReaderAt
 	} else {
 		// Supposer tar simple
-		return extractTar(tar.NewReader(bytes.NewReader(data)), destDir)
+		return extractTar(tar.NewReader(dataReader), destDir)
 	}
 }
 
-// extractTar extrait une archive tar
+// Extract a tar archive
 func extractTar(tr *tar.Reader, destDir string) error {
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
-			break
+			break // End of archive
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("error during the tar entry reading: %w", err)
 		}
 
+		// Sanitize the target path to prevent path traversal vulnerabilities
 		target := filepath.Join(destDir, header.Name)
+		if !strings.HasPrefix(target, filepath.Clean(destDir)+string(os.PathSeparator)) {
+			return fmt.Errorf("invalid tar content: '%s' trying to get out from the source repertory", header.Name)
+		}
+
+		// Get file info from header
+		info := header.FileInfo()
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0755); err != nil {
-				return err
+			if err := os.MkdirAll(target, info.Mode()); err != nil {
+				return fmt.Errorf("cannot create the repertory for the tar '%s': %w", target, err)
 			}
 		case tar.TypeReg:
-			dir := filepath.Dir(target)
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return err
+			// Ensure parent directory exists
+			parentDir := filepath.Dir(target)
+			if err := os.MkdirAll(parentDir, 0755); err != nil { // Use default mode for parent dirs
+				return fmt.Errorf("cannot the parent directory '%s' for the tar file: %w", parentDir, err)
 			}
 
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			// Create the file
+			file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
 			if err != nil {
-				return err
+				return fmt.Errorf("cannot create the tar file '%s': %w", target, err)
 			}
-
-			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
-				return err
+			// Copy contents
+			_, err = io.Copy(file, tr)
+			file.Close() // Close immediately after copy
+			if err != nil {
+				return fmt.Errorf("error during the tar content copying '%s': %w", target, err)
 			}
-			f.Close()
+		case tar.TypeSymlink:
+			// Recreate symlink
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				return fmt.Errorf("cannot create the symblink for the tar '%s' -> '%s': %w", target, header.Linkname, err)
+			}
+		case tar.TypeLink:
+			// Handle hard links (less common, might require mapping) - Skip for now
+			fmt.Printf("Warning: Hard link extraction not fully supported (from %s to %s)\n", header.Name, header.Linkname)
+		default:
+			// Skip other types (char device, block device, fifo)
+			fmt.Printf("Warning: Skipping unsupported tar entry type %c for %s\n", header.Typeflag, header.Name)
 		}
 	}
 	return nil
 }
 
-// execCmd exécute une commande shell
-func execCmd(ctx context.Context, cmdStr string) error {
-	// Dans une implémentation réelle, cette fonction utiliserait os/exec
-	// Pour l'exemple, on simule un retour réussi
+// Extract a zip archive
+func extractZip(r io.ReaderAt, size int64, destDir string) error {
+	zr, err := zip.NewReader(r, size)
+	if err != nil {
+		return fmt.Errorf("error during the zip opening: %w", err)
+	}
+
+	for _, f := range zr.File {
+		// Sanitize the target path
+		targetPath := filepath.Join(destDir, f.Name)
+		if !strings.HasPrefix(targetPath, filepath.Clean(destDir)+string(os.PathSeparator)) {
+			return fmt.Errorf("invalid content: '%s' trying to get out from the target repertory", f.Name)
+		}
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(targetPath, f.Mode()); err != nil {
+				return fmt.Errorf("cannot create the zip repertory '%s': %w", targetPath, err)
+			}
+			continue
+		}
+
+		// Ensure parent directory exists
+		parentDir := filepath.Dir(targetPath)
+		if err := os.MkdirAll(parentDir, 0755); err != nil {
+			return fmt.Errorf("cannot create the parent repertory '%s' for the zip file: %w", parentDir, err)
+		}
+
+		// Open the file inside the zip archive
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("cannot open the file '%s' in the zip: %w", f.Name, err)
+		}
+
+		// Create the destination file
+		outFile, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			rc.Close()
+			return fmt.Errorf("cannot create the targeting zip file '%s': %w", targetPath, err)
+		}
+
+		// Copy the content
+		_, err = io.Copy(outFile, rc)
+
+		// Close files
+		outFile.Close()
+		rc.Close()
+
+		if err != nil {
+			return fmt.Errorf("error during the zip content copying '%s': %w", f.Name, err)
+		}
+	}
 	return nil
 }
 
-// buildWithDocker construit une image avec l'API Docker
-func (s *BuildService) buildWithDocker(ctx context.Context, buildDir, dockerfilePath string, spec *BuildSpec) (string, string, error) {
+// Resource downloader
+func (s *BuildService) downloadFile(ctx context.Context, url, targetPath string) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("error during the request creation %s: %w", url, err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("error during the GET request for the resource URL %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed downloading of %s: status %s", url, resp.Status)
+	}
+
+	file, err := os.Create(targetPath)
+	if err != nil {
+		return fmt.Errorf("cannot create the target file %s: %w", targetPath, err)
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		return fmt.Errorf("error during the target path writing %s: %w", targetPath, err)
+	}
+
+	return nil
+}
+
+// Build a single image from a context and a specific Config
+func (s *BuildService) buildSingleImage(ctx context.Context, buildContextDir string, dockerfilePath string, spec *BuildSpec) (string, string, error) {
 	var logBuffer bytes.Buffer
 
 	// Créer le contexte de build en mémoire (tar)
-	buildContextTar, err := archive.TarWithOptions(buildDir, &archive.TarOptions{})
+	// Exclude .git by default? Or rely on .dockerignore? Let's rely on .dockerignore for now.
+	buildContextTar, err := archive.TarWithOptions(buildContextDir, &archive.TarOptions{})
 	if err != nil {
-		return "", "", fmt.Errorf("erreur lors de la création du contexte: %w", err)
+		return "", logBuffer.String(), fmt.Errorf("erreur lors de la création du contexte tar pour '%s': %w", buildContextDir, err)
 	}
 	defer buildContextTar.Close()
 
 	// Préparer les options de build
 	buildOptions := types.ImageBuildOptions{
-		Dockerfile: filepath.Base(dockerfilePath),
-		Tags:       spec.BuildConfig.Tags,
-		Remove:     true,
-		NoCache:    spec.BuildConfig.NoCache,
-		BuildArgs:  make(map[string]*string),
+		Dockerfile:  filepath.Base(dockerfilePath), // Dockerfile name relative to context root
+		Tags:        spec.BuildConfig.Tags,         // Tags defined in the main spec or step spec
+		Remove:      true,                          // Remove intermediate containers
+		ForceRemove: true,
+		NoCache:     spec.BuildConfig.NoCache,
+		BuildArgs:   make(map[string]*string),
+		PullParent:  spec.BuildConfig.Pull, // Tenter de pull l'image de base
+		Version:     types.BuilderBuildKit, // Préférer BuildKit si disponible
+		// TODO: Add Platform handling spec.BuildConfig.Platforms
+	}
+	if !spec.BuildConfig.BuildKit {
+		buildOptions.Version = types.BuilderV1 // Force legacy builder if requested
 	}
 
-	// Ajouter les arguments de build
+	// Ajouter les arguments de build (variables d'env du spec peuvent être utilisées ici si préfixées ou explicitement mappées)
 	for k, v := range spec.BuildConfig.Args {
-		value := v // Copie locale pour éviter les problèmes de pointeur
+		value := v // Copie locale
 		buildOptions.BuildArgs[k] = &value
 	}
+	// Injecter les variables d'env comme build args (optionnel, dépend de l'usage)
+	// for k, v := range mergedEnv { // Use the merged env from Build() scope if needed
+	// 	if _, exists := buildOptions.BuildArgs[k]; !exists {
+	// 		value := v
+	// 		buildOptions.BuildArgs[k] = &value
+	// 	}
+	// }
 
-	// Ajouter le target si spécifié
 	if spec.BuildConfig.Target != "" {
 		buildOptions.Target = spec.BuildConfig.Target
 	}
 
 	// Exécuter le build
+	fmt.Fprintf(&logBuffer, "Starting Docker build with context: %s, Dockerfile: %s\n", buildContextDir, dockerfilePath)
 	buildResponse, err := s.dockerClient.ImageBuild(ctx, buildContextTar, buildOptions)
 	if err != nil {
-		return "", "", fmt.Errorf("erreur lors du build Docker: %w", err)
+		// Try falling back to legacy builder if BuildKit failed?
+		if spec.BuildConfig.BuildKit && strings.Contains(err.Error(), "BuildKit") {
+			fmt.Fprintf(&logBuffer, "BuildKit build failed, trying legacy builder...\n")
+			buildOptions.Version = types.BuilderV1
+			buildResponse, err = s.dockerClient.ImageBuild(ctx, buildContextTar, buildOptions)
+		}
+		if err != nil {
+			logBuffer.WriteString(fmt.Sprintf("\nDocker build command failed: %v\n", err))
+			return "", logBuffer.String(), fmt.Errorf("erreur lors du lancement du build Docker: %w", err)
+		}
 	}
 	defer buildResponse.Body.Close()
 
-	// Lire et traiter la sortie
+	// Lire et traiter la sortie JSON
 	var imageID string
 	decoder := json.NewDecoder(buildResponse.Body)
 	for {
 		var msg jsonmessage.JSONMessage
 		if err := decoder.Decode(&msg); err != nil {
 			if err == io.EOF {
-				break
+				break // Fin normale du stream
 			}
-			return "", logBuffer.String(), err
-		}
-
-		// Traiter les messages
-		if msg.Error != nil {
-			return "", logBuffer.String(), fmt.Errorf("%s", msg.Error.Message)
+			// Log incomplete stream error?
+			logBuffer.WriteString(fmt.Sprintf("\nError decoding build response stream: %v\n", err))
+			// Return success if we already got an image ID? Or fail? Let's fail.
+			if imageID == "" {
+				return "", logBuffer.String(), fmt.Errorf("erreur de décodage du flux de build et aucun ID d'image obtenu: %w", err)
+			}
+			break // Break but potentially return success if imageID was found
 		}
 
 		if msg.Stream != "" {
 			fmt.Fprint(&logBuffer, msg.Stream)
-			// Extraire l'ID de l'image
-			if strings.Contains(msg.Stream, "Successfully built") {
+			// Try to parse image ID from common "Successfully built <id>" messages
+			if strings.Contains(msg.Stream, "Successfully built ") {
 				parts := strings.Fields(msg.Stream)
-				for i, part := range parts {
-					if part == "built" && i < len(parts)-1 {
-						imageID = parts[i+1]
-						break
-					}
+				if len(parts) >= 3 && parts[0] == "Successfully" && parts[1] == "built" {
+					// Handle potential sha256: prefix
+					id := strings.TrimPrefix(parts[2], "sha256:")
+					imageID = id
 				}
 			}
+			// Docker Engine API v1.31+ may send ID in "Successfully tagged <tag>"
+			if strings.Contains(msg.Stream, "Successfully tagged ") && imageID == "" {
+				// Less reliable way to get ID if build is tagged, might need inspection later
+			}
+		} else if msg.Status != "" {
+			logLine := msg.Status
+			if msg.Progress != nil {
+				logLine += " " + msg.Progress.String()
+			}
+			if msg.ID != "" {
+				logLine = fmt.Sprintf("[%s] %s", msg.ID, logLine)
+			}
+			fmt.Fprintln(&logBuffer, logLine)
 		}
 
-		// Traiter les messages auxiliaires
+		// Check for build errors reported in the stream
+		if msg.Error != nil {
+			logBuffer.WriteString(fmt.Sprintf("\nBuild Error: %s\n", msg.Error.Message))
+			return "", logBuffer.String(), fmt.Errorf("erreur dans le flux de build: %s", msg.Error.Message)
+		}
+
+		// Extract Image ID from Aux message (often contains the final sha256 ID)
 		if msg.Aux != nil {
 			var auxMsg struct {
 				ID string `json:"ID"`
 			}
 			if err := json.Unmarshal(*msg.Aux, &auxMsg); err == nil && auxMsg.ID != "" {
-				imageID = auxMsg.ID
+				// Prefer the ID from Aux if available
+				id := strings.TrimPrefix(auxMsg.ID, "sha256:")
+				imageID = id
 			}
+		}
+	} // End stream reading loop
+
+	if imageID == "" {
+		// If no ID found after successful stream processing, maybe inspect the tag?
+		if len(buildOptions.Tags) > 0 {
+			inspected, err := s.getImageInfoByTag(ctx, buildOptions.Tags[0])
+			if err == nil {
+				imageID = inspected.ID
+				fmt.Fprintf(&logBuffer, "\nImage ID retrieved via tag inspection: %s\n", imageID)
+			} else {
+				logBuffer.WriteString("\nBuild stream finished, but no image ID found and tag inspection failed.\n")
+				return "", logBuffer.String(), fmt.Errorf("build terminé mais impossible de déterminer l'ID de l'image finale")
+			}
+		} else {
+			logBuffer.WriteString("\nBuild stream finished, but no image ID found (and no tags specified).\n")
+			return "", logBuffer.String(), fmt.Errorf("build terminé mais impossible de déterminer l'ID de l'image finale (aucun tag)")
 		}
 	}
 
+	// Clean the image ID (remove potential sha256: prefix if still there)
+	imageID = strings.TrimPrefix(imageID, "sha256:")
+
+	fmt.Fprintf(&logBuffer, "\nBuild successful. Final Image ID: %s\n", imageID)
 	return imageID, logBuffer.String(), nil
+}
+
+// buildComposeProject itère sur les services d'un projet Compose et les construit
+func (s *BuildService) buildComposeProject(ctx context.Context, buildDir string, project *ComposeProject, spec *BuildSpec, result *BuildResult, overallLogs *strings.Builder) []string {
+	var buildErrors []string
+	composeFileDir := filepath.Dir(filepath.Join(buildDir, spec.BuildConfig.ComposeFile)) // Directory containing the compose file
+
+	for Name, service := range project.Services {
+		if service.Build == nil {
+			// Service uses an existing image, maybe pull it?
+			if service.Image != "" {
+				overallLogs.WriteString(fmt.Sprintf("Service '%s' uses image '%s'. Pulling...\n", Name, service.Image))
+				if err := s.pullImage(ctx, service.Image, overallLogs); err != nil {
+					overallLogs.WriteString(fmt.Sprintf("Warning: Failed to pull image '%s' for service '%s': %v\n", service.Image, Name, err))
+					// Continue or fail? Let's continue.
+				}
+			} else {
+				overallLogs.WriteString(fmt.Sprintf("Service '%s' has no 'build' section and no 'image' specified. Skipping build.\n", Name))
+			}
+			continue
+		}
+
+		overallLogs.WriteString(fmt.Sprintf("--- Building Service: %s ---\n", Name))
+
+		// Determine build context and Dockerfile path relative to the compose file directory
+		contextPath := service.Build.Context
+		if contextPath == "" || contextPath == "." {
+			contextPath = composeFileDir
+		} else if !filepath.IsAbs(contextPath) {
+			contextPath = filepath.Join(composeFileDir, contextPath)
+		}
+		// Clean the path
+		contextPath = filepath.Clean(contextPath)
+
+		dockerfilePath := service.Build.Dockerfile
+		if dockerfilePath == "" {
+			dockerfilePath = "Dockerfile" // Default Dockerfile name
+		}
+		// Dockerfile path is relative to the context path
+		fullDockerfilePath := filepath.Join(contextPath, dockerfilePath)
+
+		overallLogs.WriteString(fmt.Sprintf("Service '%s': Context='%s', Dockerfile='%s'\n", Name, contextPath, fullDockerfilePath))
+
+		// Create a temporary BuildSpec for this service build
+		serviceSpec := &BuildSpec{
+			Name:    fmt.Sprintf("%s-%s-service-%s", spec.Name, spec.Version, Name),
+			Version: "latest", // Or derive from main spec?
+			BuildConfig: BuildConfig{
+				Args:    make(map[string]string),                  // Start with empty args
+				NoCache: spec.BuildConfig.NoCache,                 // Inherit NoCache setting
+				Target:  service.Build.Target,                     // Inherit Target setting
+				Pull:    spec.BuildConfig.Pull,                    // Inherit Pull setting
+				Tags:    []string{fmt.Sprintf("%s:latest", Name)}, // Default tag for the service image
+				// Use buildkit setting from main spec?
+				BuildKit: spec.BuildConfig.BuildKit,
+			},
+		}
+
+		// Add build args from main spec first
+		for k, v := range spec.BuildConfig.Args {
+			serviceSpec.BuildConfig.Args[k] = v
+		}
+		// Override/add with build args from compose file service.build.args
+		if service.Build.Args != nil {
+			for k, v := range service.Build.Args {
+				// Compose args can be string pointers, handle nil
+				if v != nil {
+					serviceSpec.BuildConfig.Args[k] = *v
+				} else {
+					// Handle case where arg is defined but has no value (e.g., ARG name)
+					// We might need to resolve these from the environment?
+					// For now, let's just skip them or assign an empty string?
+					// buildOptions.BuildArgs expects map[string]*string, so nil is possible.
+					serviceSpec.BuildConfig.Args[k] = "" // Or handle differently?
+				}
+			}
+		}
+
+		// Build the image for the service
+		imageID, logs, err := s.buildSingleImage(ctx, contextPath, fullDockerfilePath, serviceSpec)
+		overallLogs.WriteString(fmt.Sprintf("Logs for service %s:\n%s\n", Name, logs))
+
+		if err != nil {
+			errMsg := fmt.Sprintf("erreur lors du build du service '%s': %v", Name, err)
+			buildErrors = append(buildErrors, errMsg)
+			overallLogs.WriteString(errMsg + "\n")
+			// Store partial results?
+			result.ServiceOutputs[Name] = ServiceOutput{Logs: logs}
+			continue // Continue to build other services even if one fails
+		}
+
+		imageSize, sizeErr := s.getImageSize(ctx, imageID)
+		if sizeErr != nil {
+			overallLogs.WriteString(fmt.Sprintf("Warning: could not get size for image %s (service %s): %v\n", imageID, Name, sizeErr))
+		}
+
+		// Store results for this service
+		result.ImageIDs[Name] = imageID
+		result.ImageSizes[Name] = imageSize
+		result.ServiceOutputs[Name] = ServiceOutput{
+			ImageID:   imageID,
+			ImageSize: imageSize,
+			Logs:      logs,
+		}
+		overallLogs.WriteString(fmt.Sprintf("Service '%s' built successfully. ImageID: %s, Size: %d\n", Name, imageID, imageSize))
+		overallLogs.WriteString(fmt.Sprintf("--- Finished Service: %s ---\n", Name))
+
+	} // End loop over services
+
+	return buildErrors
+}
+
+// pullImage pulls a Docker image if it doesn't exist locally
+func (s *BuildService) pullImage(ctx context.Context, imageName string, logs io.Writer) error {
+	// Check if image exists locally first to avoid unnecessary pulls
+	_, _, err := s.dockerClient.ImageInspectWithRaw(ctx, imageName)
+	if err == nil {
+		fmt.Fprintf(logs, "Image '%s' already exists locally.\n", imageName)
+		return nil // Image found
+	}
+	if !client.IsErrNotFound(err) {
+		// Different error during inspection
+		return fmt.Errorf("erreur lors de l'inspection de l'image '%s' avant pull: %w", imageName, err)
+	}
+
+	// Image not found, proceed to pull
+	fmt.Fprintf(logs, "Pulling image '%s'...\n", imageName)
+	reader, err := s.dockerClient.ImagePull(ctx, imageName, image.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("erreur lors du lancement du pull de l'image '%s': %w", imageName, err)
+	}
+	defer reader.Close()
+
+	// Write pull progress to logs
+	termFd, isTerm := term.GetFdInfo(logs) // Check if logs is a terminal for progress bars
+	err = jsonmessage.DisplayJSONMessagesStream(reader, logs, termFd, isTerm, nil)
+	if err != nil {
+		return fmt.Errorf("erreur lors de la lecture du flux de pull pour l'image '%s': %w", imageName, err)
+	}
+
+	fmt.Fprintf(logs, "Image '%s' pulled successfully.\n", imageName)
+	return nil
 }
 
 // getImageSize récupère la taille d'une image Docker
 func (s *BuildService) getImageSize(ctx context.Context, imageID string) (int64, error) {
+	// Use the image ID (which should be sha256 or short ID) for inspection
 	summary, _, err := s.dockerClient.ImageInspectWithRaw(ctx, imageID)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("erreur d'inspection de l'image '%s': %w", imageID, err)
 	}
 	return summary.Size, nil
 }
 
-// exportAndUploadImage exporte une image Docker et l'upload vers B2
-func (s *BuildService) exportAndUploadImage(ctx context.Context, imageID string, spec *BuildSpec) ([]string, error) {
-	if s.b2Config == nil {
-		return nil, fmt.Errorf("configuration B2 non définie")
+// getImageInfoByTag récupère les infos d'une image par son tag
+func (s *BuildService) getImageInfoByTag(ctx context.Context, imageTag string) (*types.ImageInspect, error) {
+	summary, _, err := s.dockerClient.ImageInspectWithRaw(ctx, imageTag)
+	if err != nil {
+		return nil, fmt.Errorf("erreur d'inspection de l'image taggée '%s': %w", imageTag, err)
 	}
+	return &summary, nil
+}
 
-	// Créer un reader pour l'image exportée
+// saveImageLocally sauvegarde une image Docker dans un fichier .tar local
+func (s *BuildService) saveImageLocally(ctx context.Context, imageID string, targetPath string) error {
 	reader, err := s.dockerClient.ImageSave(ctx, []string{imageID})
 	if err != nil {
-		return nil, fmt.Errorf("erreur lors de l'export de l'image: %w", err)
+		return fmt.Errorf("erreur lors de l'export de l'image '%s': %w", imageID, err)
 	}
 	defer reader.Close()
 
-	// Lire l'image en mémoire
-	imageData, err := io.ReadAll(reader)
+	file, err := os.Create(targetPath)
 	if err != nil {
-		return nil, fmt.Errorf("erreur lors de la lecture de l'image: %w", err)
+		return fmt.Errorf("impossible de créer le fichier image local '%s': %w", targetPath, err)
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, reader)
+	if err != nil {
+		return fmt.Errorf("erreur lors de l'écriture dans le fichier image local '%s': %w", targetPath, err)
 	}
 
-	// Initialiser le client B2
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	defer cancel()
+	return nil
+}
 
+// exportAndUploadImage exporte une image Docker et l'upload vers B2 (modifié pour nom/version/tags)
+func (s *BuildService) exportAndUploadImage(ctx context.Context, imageID, serviceName, version string, tags []string) ([]string, error) {
+	if s.b2Config == nil {
+		return nil, fmt.Errorf("configuration B2 non définie pour upload")
+	}
+
+	// Créer un reader pour l'image exportée
+	reader, err := s.dockerClient.ImageSave(ctx, []string{imageID}) // Use the actual image ID
+	if err != nil {
+		return nil, fmt.Errorf("erreur lors de l'export de l'image ID '%s': %w", imageID, err)
+	}
+	defer reader.Close()
+
+	// Utiliser io.Pipe pour streamer directement vers B2 sans charger en mémoire (plus efficace pour grosses images)
+	pr, pw := io.Pipe()
+
+	var uploadErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// Goroutine pour uploader depuis le pipe reader
+	go func() {
+		defer wg.Done()
+		defer pr.Close() // Fermer le reader quand l'upload est fini ou échoue
+
+		b2Client, err := b2.NewClient(context.WithoutCancel(ctx), s.b2Config.AccountID, s.b2Config.ApplicationKey, b2.UserAgent("build-service")) // Use context without timeout for upload potentially
+		if err != nil {
+			uploadErr = fmt.Errorf("erreur lors de l'initialisation du client B2: %w", err)
+			return
+		}
+
+		bucket, err := b2Client.Bucket(ctx, s.b2Config.BucketName)
+		if err != nil {
+			uploadErr = fmt.Errorf("erreur d'accès au bucket B2 '%s': %w", s.b2Config.BucketName, err)
+			return
+		}
+
+		// Nom d'objet principal basé sur service et version
+		imageName := fmt.Sprintf("%s-%s.tar", serviceName, version)
+		objectPath := filepath.Join(s.b2Config.BasePath, imageName)
+
+		obj := bucket.Object(objectPath)
+		writer := obj.NewWriter(ctx)
+
+		fmt.Printf("Starting B2 upload to %s...\n", objectPath) // Log start
+		_, err = io.Copy(writer, pr)                            // Lire depuis le pipe et écrire vers B2
+		if err != nil {
+			writer.Close() // Important to close writer even on error
+			uploadErr = fmt.Errorf("erreur lors de l'écriture stream vers B2 (%s): %w", objectPath, err)
+			return
+		}
+
+		err = writer.Close() // Finaliser l'upload
+		if err != nil {
+			uploadErr = fmt.Errorf("erreur lors de la finalisation de l'upload B2 (%s): %w", objectPath, err)
+			return
+		}
+		fmt.Printf("Finished B2 upload to %s.\n", objectPath) // Log success
+		// Upload successful for the main object path
+	}()
+
+	// Goroutine pour copier depuis Docker save vers le pipe writer
+	var copyErr error
+	go func() {
+		defer pw.Close() // Fermer le writer quand la copie est finie ou échoue
+		_, copyErr = io.Copy(pw, reader)
+	}()
+
+	// Attendre la fin de l'upload
+	wg.Wait()
+
+	// Vérifier les erreurs
+	if copyErr != nil {
+		return nil, fmt.Errorf("erreur lors de la lecture des données de l'image Docker: %w", copyErr)
+	}
+	if uploadErr != nil {
+		return nil, fmt.Errorf("erreur lors de l'upload vers B2: %w", uploadErr)
+	}
+
+	// L'upload principal a réussi. Maintenant, gérer les tags comme des références (petits fichiers texte).
+	// Note: B2 ne supporte pas les liens symboliques directs. On crée des fichiers de ref.
+	objectNames := []string{filepath.Join(s.b2Config.BasePath, fmt.Sprintf("%s-%s.tar", serviceName, version))} // Start with the main path
+
+	// Re-init client/bucket for tag uploads (ou réutiliser si possible)
 	b2Client, err := b2.NewClient(ctx, s.b2Config.AccountID, s.b2Config.ApplicationKey, b2.UserAgent("build-service"))
 	if err != nil {
-		return nil, fmt.Errorf("erreur lors de l'initialisation du client B2: %w", err)
+		// Log error mais on a déjà réussi l'upload principal
+		fmt.Printf("Warning: Failed to re-init B2 client for tag refs: %v\n", err)
+		return objectNames, nil // Return only the main object name
 	}
-
-	// Accéder au bucket
 	bucket, err := b2Client.Bucket(ctx, s.b2Config.BucketName)
 	if err != nil {
-		panic(err)
+		fmt.Printf("Warning: Failed to get B2 bucket for tag refs: %v\n", err)
+		return objectNames, nil
 	}
 
-	// Générer un nom d'objet basé sur l'ID de l'image et les tags
-	imageName := fmt.Sprintf("%s-%s.tar", spec.Name, spec.Version)
-	objectPath := filepath.Join(s.b2Config.BasePath, imageName)
-
-	// Uploader l'image
-	obj := bucket.Object(objectPath)
-	writer := obj.NewWriter(ctx)
-
-	if _, err := writer.Write(imageData); err != nil {
-		writer.Close()
-		return nil, fmt.Errorf("erreur lors de l'écriture vers B2: %w", err)
-	}
-
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("erreur lors de la finalisation de l'upload B2: %w", err)
-	}
-
-	// Pour chaque tag, exporter aussi une référence
-	objectNames := []string{objectPath}
-	for _, tag := range spec.BuildConfig.Tags {
-		// Nettoyer le tag pour en faire un nom de fichier valide
+	for _, tag := range tags {
 		cleanTag := strings.ReplaceAll(tag, ":", "-")
-		cleanTag = strings.ReplaceAll(cleanTag, "/", "-")
+		cleanTag = strings.ReplaceAll(cleanTag, "/", "_") // Replace slashes too
+		tagFileName := fmt.Sprintf("%s.ref.txt", cleanTag)
+		tagPath := filepath.Join(s.b2Config.BasePath, tagFileName)
 
-		tagPath := filepath.Join(s.b2Config.BasePath, cleanTag+".tar")
-
-		// Créer un lien symbolique/référence dans B2
-		// Note: B2 ne supporte pas directement les liens symboliques, on pourrait soit:
-		// 1. Uploader à nouveau l'image (gaspillage d'espace)
-		// 2. Créer un petit fichier de référence qui pointe vers l'image principale
+		refContent := fmt.Sprintf("ImageID: %s\nTag: %s\nVersion: %s\nServiceName: %s\nMainObject: %s\n",
+			imageID, tag, version, serviceName, objectNames[0])
 
 		refObj := bucket.Object(tagPath)
 		refWriter := refObj.NewWriter(ctx)
 
-		refContent := fmt.Sprintf("Reference to: %s\nImage ID: %s\n", objectPath, imageID)
-		if _, err := refWriter.Write([]byte(refContent)); err != nil {
+		_, err = refWriter.Write([]byte(refContent))
+		if err != nil {
 			refWriter.Close()
-			return objectNames, err // Retourner les objets déjà uploadés
+			fmt.Printf("Warning: Failed to write B2 ref file for tag '%s' (%s): %v\n", tag, tagPath, err)
+			continue // Continue with other tags
 		}
-
-		if err := refWriter.Close(); err != nil {
-			return objectNames, err
+		err = refWriter.Close()
+		if err != nil {
+			fmt.Printf("Warning: Failed to close B2 ref file for tag '%s' (%s): %v\n", tag, tagPath, err)
+			continue
 		}
-
 		objectNames = append(objectNames, tagPath)
 	}
 
 	return objectNames, nil
 }
 
-// CreateContainer crée un conteneur à partir d'une image
-func (s *BuildService) CreateContainer(ctx context.Context, imageID string, config *container.Config, hostConfig *container.HostConfig) (string, error) {
-	if config == nil {
-		config = &container.Config{
-			Image: imageID,
-		}
-	} else if config.Image == "" {
-		config.Image = imageID
-	}
-
-	resp, err := s.dockerClient.ContainerCreate(ctx, config, hostConfig, nil, nil, "")
+// extractFromContainer copie un fichier/dossier depuis un conteneur temporaire
+func (s *BuildService) extractFromContainer(ctx context.Context, imageID, containerPath string) ([]byte, error) {
+	// Créer un conteneur temporaire basé sur l'image
+	resp, err := s.dockerClient.ContainerCreate(ctx, &container.Config{Image: imageID}, nil, nil, nil, "")
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("erreur lors de la création du conteneur temporaire pour l'extraction: %w", err)
 	}
+	containerID := resp.ID
+	defer s.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}) // Cleanup
 
-	return resp.ID, nil
-}
-
-// RunContainer démarre un conteneur et attend sa terminaison
-func (s *BuildService) RunContainer(ctx context.Context, containerID string) (string, error) {
-	if err := s.dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		return "", err
-	}
-
-	// Attendre que le conteneur se termine
-	statusCh, errCh := s.dockerClient.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
-
-	var logs bytes.Buffer
-
-	// Récupérer les logs du conteneur
-	logsOptions := container.LogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-		Follow:     true,
-	}
-
-	logsReader, err := s.dockerClient.ContainerLogs(ctx, containerID, logsOptions)
+	// Copier le fichier/dossier depuis le conteneur
+	readCloser, _, err := s.dockerClient.CopyFromContainer(ctx, containerID, containerPath)
 	if err != nil {
-		return "", err
-	}
-	defer logsReader.Close()
-
-	// Copier les logs dans notre buffer
-	_, err = stdcopy.StdCopy(&logs, &logs, logsReader)
-	if err != nil {
-		return logs.String(), err
-	}
-
-	// Attendre la fin du conteneur
-	select {
-	case err := <-errCh:
-		return logs.String(), err
-	case <-statusCh:
-		return logs.String(), nil
-	}
-}
-
-// ExportContainer exporte un conteneur vers un fichier tar
-func (s *BuildService) ExportContainer(ctx context.Context, containerID string) ([]byte, error) {
-	// Exporter le conteneur
-	readCloser, err := s.dockerClient.ContainerExport(ctx, containerID)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("erreur lors de la copie depuis le conteneur '%s' (path: %s): %w", containerID, containerPath, err)
 	}
 	defer readCloser.Close()
 
-	// Lire tous les données du conteneur
-	return io.ReadAll(readCloser)
-}
+	// Lire le contenu de l'archive tar retournée par CopyFromContainer
+	tarReader := tar.NewReader(readCloser)
 
-// Cleanup nettoie les ressources Docker (images, conteneurs)
-func (s *BuildService) Cleanup(ctx context.Context, olderThan time.Duration) error {
-	// Supprimer les conteneurs arrêtés
-	containers, err := s.dockerClient.ContainerList(ctx, container.ListOptions{All: true})
+	// On s'attend à un seul fichier (ou le premier fichier si c'est un dossier)
+	// Pour extraire un dossier complet, il faudrait itérer et recréer la structure
+	header, err := tarReader.Next()
+	if err == io.EOF {
+		return nil, fmt.Errorf("aucune donnée trouvée dans l'archive copiée depuis le conteneur (path: %s)", containerPath)
+	}
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("erreur lors de la lecture de l'en-tête tar depuis la copie du conteneur: %w", err)
 	}
 
-	now := time.Now()
-	for _, c := range containers {
-		createdTime := time.Unix(c.Created, 0)
-		if now.Sub(createdTime) > olderThan {
-			// Supprimer le conteneur
-			err := s.dockerClient.ContainerRemove(ctx, c.ID, container.RemoveOptions{
-				Force: true,
-			})
-			if err != nil {
-				// Log l'erreur mais continuer
-				fmt.Printf("Erreur lors de la suppression du conteneur %s: %v\n", c.ID, err)
+	// Vérifier si c'est un fichier régulier
+	if header.Typeflag != tar.TypeReg {
+		// Si c'est un dossier, on pourrait vouloir lire le premier fichier ou échouer?
+		// Pour un binaire, on s'attend à un fichier.
+		// Tentative : si c'est un dossier, lire le contenu du premier fichier trouvé dedans?
+		// Ou simplement retourner une erreur si ce n'est pas un fichier régulier.
+		return nil, fmt.Errorf("le chemin extrait '%s' n'est pas un fichier régulier (type: %c)", containerPath, header.Typeflag)
+	}
+
+	// Lire le contenu du fichier
+	fileData, err := io.ReadAll(tarReader)
+	if err != nil {
+		return nil, fmt.Errorf("erreur lors de la lecture du contenu du fichier depuis l'archive tar: %w", err)
+	}
+
+	return fileData, nil
+}
+
+// generateRunYAML crée la structure pour *.run.yml (CORRIGÉ pour accepter projet parsé)
+func (s *BuildService) generateRunYAML(ctx context.Context, spec *BuildSpec, result *BuildResult, runtimeEnv map[string]string, finalImageTags map[string][]string, composeProject *ComposeProject) (*RunYAML, error) { // Modifié: Prend *ComposeProject
+	runYAML := &RunYAML{
+		Version:  "1.0",
+		Services: make(map[string]RunService),
+	}
+
+	if composeProject != nil { // Utiliser le projet parsé si fourni
+		// Base run.yml on the parsed compose file structure
+		for serviceName, service := range composeProject.Services {
+			// Skip build-only services? (Nécessite une logique/annotation pour identifier)
+			// Pour l'instant, on inclut tous les services définis.
+			// isBuildOnly := false // Logique à ajouter si nécessaire
+			// if isBuildOnly { continue }
+
+			runService := RunService{
+				Image:       s.getImageRefForRun(serviceName, spec.RunConfigDef.ArtifactStorage, result, finalImageTags),
+				Command:     service.Command,
+				Entrypoint:  service.Entrypoint,
+				Environment: make(map[string]string),
+				Ports:       service.Ports,   // Directement []string maintenant
+				Volumes:     service.Volumes, // Directement []string maintenant
+				Restart:     service.Restart,
+				DependsOn:   service.DependsOn, // Directement []string maintenant
 			}
-		}
-	}
 
-	// Supprimer les images non utilisées
-	pruneReport, err := s.dockerClient.ImagesPrune(ctx, filters.NewArgs(
-		filters.Arg("until", fmt.Sprintf("%dm", int(olderThan.Minutes()))),
-	))
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Images nettoyées: %d, espace libéré: %d bytes\n",
-		len(pruneReport.ImagesDeleted), pruneReport.SpaceReclaimed)
-
-	return nil
-}
-
-// UploadArtifactToB2 upload un artefact vers B2
-func (s *BuildService) UploadArtifactToB2(ctx context.Context, data []byte, objectPath string) (string, error) {
-	if s.b2Config == nil {
-		return "", fmt.Errorf("configuration B2 non définie")
-	}
-
-	// Initialiser le client B2
-	b2Client, err := b2.NewClient(ctx, s.b2Config.AccountID, s.b2Config.ApplicationKey, b2.UserAgent("build-service"))
-	if err != nil {
-		return "", fmt.Errorf("erreur lors de l'initialisation du client B2: %w", err)
-	}
-
-	// Accéder au bucket
-	bucket, err := b2Client.Bucket(ctx, s.b2Config.BucketName)
-	if err != nil {
-		panic(err)
-	}
-
-	// Préparer le chemin complet
-	fullPath := filepath.Join(s.b2Config.BasePath, objectPath)
-
-	// Uploader l'artefact
-	obj := bucket.Object(fullPath)
-	writer := obj.NewWriter(ctx)
-
-	// Définir le type de contenu si possible
-	// if ext := filepath.Ext(objectPath); ext != "" {
-	// 	switch strings.ToLower(ext) {
-	// 	case ".tar":
-	// 		writer.SetContentType("application/x-tar")
-	// 	case ".gz", ".tgz":
-	// 		writer.SetContentType("application/gzip")
-	// 	case ".zip":
-	// 		writer.SetContentType("application/zip")
-	// 	case ".json":
-	// 		writer.SetContentType("application/json")
-	// 	case ".txt":
-	// 		writer.SetContentType("text/plain")
-	// 	}
-	// }
-
-	if _, err := writer.Write(data); err != nil {
-		writer.Close()
-		return "", fmt.Errorf("erreur lors de l'écriture vers B2: %w", err)
-	}
-
-	if err := writer.Close(); err != nil {
-		return "", fmt.Errorf("erreur lors de la finalisation de l'upload B2: %w", err)
-	}
-
-	return fullPath, nil
-}
-
-// DownloadImageFromB2 télécharge une image Docker depuis B2
-func (s *BuildService) DownloadImageFromB2(ctx context.Context, objectPath string) (string, error) {
-	if s.b2Config == nil {
-		return "", fmt.Errorf("configuration B2 non définie")
-	}
-
-	// Initialiser le client B2
-	b2Client, err := b2.NewClient(ctx, s.b2Config.AccountID, s.b2Config.ApplicationKey, b2.UserAgent("build-service"))
-	if err != nil {
-		return "", fmt.Errorf("erreur lors de l'initialisation du client B2: %w", err)
-	}
-
-	// Accéder au bucket
-	bucket, err := b2Client.Bucket(ctx, s.b2Config.BucketName)
-	if err != nil {
-		panic(err)
-	}
-
-	// Préparer le chemin complet
-	fullPath := objectPath
-	if !strings.HasPrefix(objectPath, s.b2Config.BasePath) {
-		fullPath = filepath.Join(s.b2Config.BasePath, objectPath)
-	}
-
-	// Télécharger l'objet
-	obj := bucket.Object(fullPath)
-	reader := obj.NewReader(ctx)
-	defer reader.Close()
-
-	// Lire l'objet en mémoire
-	imageData, err := io.ReadAll(reader)
-	if err != nil {
-		return "", fmt.Errorf("erreur lors de la lecture depuis B2: %w", err)
-	}
-
-	// Charger l'image dans Docker
-	loadResp, err := s.dockerClient.ImageLoad(ctx, bytes.NewReader(imageData))
-	if err != nil {
-		return "", fmt.Errorf("erreur lors du chargement de l'image: %w", err)
-	}
-	defer loadResp.Body.Close()
-
-	// Lire la réponse pour obtenir l'ID de l'image
-	var loadOutput struct {
-		Stream string `json:"stream"`
-	}
-
-	decoder := json.NewDecoder(loadResp.Body)
-	imageID := ""
-
-	for {
-		if err := decoder.Decode(&loadOutput); err != nil {
-			if err == io.EOF {
-				break
+			// Combine env vars: Global runtime env puis Service-specific
+			for k, v := range runtimeEnv {
+				runService.Environment[k] = v
 			}
-			return "", fmt.Errorf("erreur lors de la lecture de la réponse: %w", err)
-		}
-
-		// Extraire l'ID de l'image si présent
-		if strings.Contains(loadOutput.Stream, "Loaded image") {
-			parts := strings.Fields(loadOutput.Stream)
-			if len(parts) > 2 {
-				imageID = parts[len(parts)-1]
-				imageID = strings.TrimSpace(imageID)
-				break
+			if service.Environment != nil {
+				for k, vPtr := range service.Environment {
+					if vPtr != nil {
+						// NOTE: Pas d'interpolation ici ! Les valeurs sont littérales.
+						runService.Environment[k] = *vPtr
+					} else {
+						// Variable définie sans valeur (ex: FOO:) -> essayer l'env host? Mettre vide?
+						// Mettons vide pour l'instant pour la simplicité.
+						runService.Environment[k] = ""
+					}
+				}
 			}
-		}
-	}
+			// Copier d'autres champs si définis dans RunService (ex: HealthCheck, Labels)
+			// runService.HealthCheck = service.HealthCheck // Si RunService a un HealthCheck
 
-	// Si on n'a pas trouvé d'ID explicite, lister les images pour trouver la plus récente
-	if imageID == "" {
-		images, err := s.dockerClient.ImageList(ctx, image.ListOptions{})
-		if err != nil {
-			return "", fmt.Errorf("erreur lors de la liste des images: %w", err)
+			runYAML.Services[serviceName] = runService
 		}
 
-		if len(images) > 0 {
-			// Prendre la plus récente (la première de la liste)
-			imageID = images[0].ID
-		}
-	}
-
-	return imageID, nil
-}
-
-// BuildWithMultipleCodebases construit une image Docker à partir de plusieurs codebases
-func (s *BuildService) BuildWithMultipleCodebases(ctx context.Context, spec *BuildSpec) (*BuildResult, error) {
-	// Validation des paramètres
-	if len(spec.Codebases) < 2 {
-		return nil, fmt.Errorf("au moins deux codebases sont nécessaires pour cette opération")
-	}
-
-	return s.Build(ctx, spec)
-}
-
-// SaveDockerImageToBuffer exporte une image Docker vers un buffer en mémoire
-func (s *BuildService) SaveDockerImageToBuffer(ctx context.Context, imageID string) ([]byte, error) {
-	// Exporter l'image
-	reader, err := s.dockerClient.ImageSave(ctx, []string{imageID})
-	if err != nil {
-		return nil, fmt.Errorf("erreur lors de l'export de l'image: %w", err)
-	}
-	defer reader.Close()
-
-	// Lire les données en mémoire
-	var buf bytes.Buffer
-	_, err = io.Copy(&buf, reader)
-	if err != nil {
-		return nil, fmt.Errorf("erreur lors de la lecture des données d'image: %w", err)
-	}
-
-	return buf.Bytes(), nil
-}
-
-// CreateDockerfileFromMultipleCodebases crée un Dockerfile optimisé pour combiner plusieurs bases de code
-func (s *BuildService) CreateDockerfileFromMultipleCodebases(spec *BuildSpec) (string, error) {
-	if len(spec.Codebases) < 1 {
-		return "", fmt.Errorf("au moins une codebase est nécessaire")
-	}
-
-	var dockerfile strings.Builder
-
-	// Si un Dockerfile personnalisé est fourni, l'utiliser tel quel
-	if spec.BuildConfig.Dockerfile != "" {
-		return spec.BuildConfig.Dockerfile, nil
-	}
-
-	// Si aucun Dockerfile personnalisé n'est fourni, en créer un qui combine les codebases
-	// Utiliser l'image de base spécifiée ou une image par défaut
-	baseImage := spec.BuildConfig.BaseImage
-	if baseImage == "" {
-		baseImage = "alpine:latest" // Image par défaut
-	}
-
-	dockerfile.WriteString(fmt.Sprintf("FROM %s\n\n", baseImage))
-	dockerfile.WriteString("WORKDIR /app\n\n")
-
-	// Ajouter chaque codebase
-	for _, codebase := range spec.Codebases {
-		dockerfile.WriteString(fmt.Sprintf("# Ajout de la codebase %s\n", codebase.Name))
-		dockerfile.WriteString(fmt.Sprintf("COPY %s/ /app/%s/\n\n", codebase.Name, codebase.Name))
-	}
-
-	// Exposer le port 8080 par défaut
-	dockerfile.WriteString("EXPOSE 8080\n\n")
-
-	// Commande par défaut
-	dockerfile.WriteString("CMD [\"sh\", \"-c\", \"echo 'Image construite avec succès à partir de multiples codebases'\"]\n")
-
-	return dockerfile.String(), nil
-}
-
-// BuildWithBufferInput construit une image Docker à partir de données en mémoire
-func (s *BuildService) BuildWithBufferInput(ctx context.Context, dockerfile string, contextData map[string][]byte, tags []string) (*BuildResult, error) {
-	tmpDir, err := ioutil.TempDir("", "docker-build-buffer-")
-	if err != nil {
-		return nil, fmt.Errorf("impossible de créer un répertoire temporaire: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Créer le Dockerfile
-	dockerfilePath := filepath.Join(tmpDir, "Dockerfile")
-	if err := ioutil.WriteFile(dockerfilePath, []byte(dockerfile), 0644); err != nil {
-		return nil, fmt.Errorf("erreur lors de la création du Dockerfile: %w", err)
-	}
-
-	// Créer les fichiers de contexte
-	for filePath, content := range contextData {
-		fullPath := filepath.Join(tmpDir, filePath)
-
-		// Créer les répertoires parents
-		dirPath := filepath.Dir(fullPath)
-		if err := os.MkdirAll(dirPath, 0755); err != nil {
-			return nil, fmt.Errorf("erreur lors de la création du répertoire %s: %w", dirPath, err)
-		}
-
-		// Écrire le fichier
-		if err := ioutil.WriteFile(fullPath, content, 0644); err != nil {
-			return nil, fmt.Errorf("erreur lors de l'écriture du fichier %s: %w", filePath, err)
-		}
-	}
-
-	// Créer une spécification de build minimale
-	spec := &BuildSpec{
-		Name:    "buffer-build",
-		Version: time.Now().Format("20060102-150405"),
-		BuildConfig: BuildConfig{
-			Tags: tags,
-		},
-	}
-
-	// Construire l'image
-	imageID, logs, err := s.buildWithDocker(ctx, tmpDir, dockerfilePath, spec)
-	if err != nil {
-		return &BuildResult{
-			Success:      false,
-			Logs:         logs,
-			ErrorMessage: err.Error(),
-		}, err
-	}
-
-	// Récupérer la taille de l'image
-	imageSize, _ := s.getImageSize(ctx, imageID)
-
-	return &BuildResult{
-		Success:   true,
-		ImageID:   imageID,
-		ImageSize: imageSize,
-		Logs:      logs,
-	}, nil
-}
-
-// GetImageInfo récupère des informations détaillées sur une image Docker
-func (s *BuildService) GetImageInfo(ctx context.Context, imageID string) (*types.ImageInspect, error) {
-	inspect, _, err := s.dockerClient.ImageInspectWithRaw(ctx, imageID)
-	if err != nil {
-		return nil, err
-	}
-	return &inspect, nil
-}
-
-// TagImage ajoute un tag à une image Docker
-func (s *BuildService) TagImage(ctx context.Context, imageID string, tag string) error {
-	return s.dockerClient.ImageTag(ctx, imageID, tag)
-}
-
-// PushImage pousse une image vers un registry Docker
-func (s *BuildService) PushImage(ctx context.Context, tag string, auth string) (string, error) {
-	var authConfig interface{}
-
-	// Si auth est fourni, le décoder
-	if auth != "" {
-		authJSON, err := base64.StdEncoding.DecodeString(auth)
-		if err != nil {
-			return "", fmt.Errorf("erreur lors du décodage de l'authentification: %w", err)
-		}
-
-		if err := json.Unmarshal(authJSON, &authConfig); err != nil {
-			return "", fmt.Errorf("erreur lors du parsing de l'authentification: %w", err)
-		}
-	}
-
-	// Encoder l'authentification pour l'API Docker
-	encodedAuth, err := json.Marshal(authConfig)
-	if err != nil {
-		return "", fmt.Errorf("erreur lors de l'encodage de l'authentification: %w", err)
-	}
-	authStr := base64.URLEncoding.EncodeToString(encodedAuth)
-
-	// Options de push
-	options := image.PushOptions{
-		RegistryAuth: authStr,
-	}
-
-	// Push l'image
-	pushResp, err := s.dockerClient.ImagePush(ctx, tag, options)
-	if err != nil {
-		return "", fmt.Errorf("erreur lors du push de l'image: %w", err)
-	}
-	defer pushResp.Close()
-
-	// Lire les logs du push
-	var logs bytes.Buffer
-	decoder := json.NewDecoder(pushResp)
-
-	for {
-		var msg jsonmessage.JSONMessage
-		if err := decoder.Decode(&msg); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return logs.String(), fmt.Errorf("erreur lors de la lecture des logs: %w", err)
-		}
-
-		if msg.Error != nil {
-			return logs.String(), fmt.Errorf("erreur dans le push: %s", msg.Error.Message)
-		}
-
-		if msg.Status != "" {
-			fmt.Fprintf(&logs, "%s: %s\n", time.Now().Format("15:04:05"), msg.Status)
-		}
-		if msg.Progress != nil {
-			fmt.Fprintf(&logs, "%s\n", msg.Progress.String())
-		}
-	}
-
-	return logs.String(), nil
-}
-
-// CompressAndUploadArtifacts compresse les artefacts et les upload vers B2
-func (s *BuildService) CompressAndUploadArtifacts(ctx context.Context, artifacts map[string][]byte, name string) (string, error) {
-	if len(artifacts) == 0 {
-		return "", fmt.Errorf("aucun artefact à compresser")
-	}
-
-	// Créer une archive tar.gz en mémoire
-	var buf bytes.Buffer
-	gzw := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gzw)
-
-	// Ajouter chaque artefact
-	for path, data := range artifacts {
-		header := &tar.Header{
-			Name: path,
-			Mode: 0644,
-			Size: int64(len(data)),
-		}
-
-		if err := tw.WriteHeader(header); err != nil {
-			return "", fmt.Errorf("erreur lors de l'écriture de l'en-tête tar: %w", err)
-		}
-
-		if _, err := tw.Write(data); err != nil {
-			return "", fmt.Errorf("erreur lors de l'écriture des données tar: %w", err)
-		}
-	}
-
-	// Fermer les writers
-	if err := tw.Close(); err != nil {
-		return "", err
-	}
-	if err := gzw.Close(); err != nil {
-		return "", err
-	}
-
-	// Générer un nom pour l'archive
-	archiveName := fmt.Sprintf("%s-artifacts-%s.tar.gz", name, time.Now().Format("20060102-150405"))
-
-	// Upload vers B2
-	return s.UploadArtifactToB2(ctx, buf.Bytes(), archiveName)
-}
-
-// ExecuteInContainer exécute une commande dans un conteneur temporaire basé sur une image
-func (s *BuildService) ExecuteInContainer(ctx context.Context, imageID string, cmd []string, env []string) (string, error) {
-	// Configuration du conteneur
-	config := &container.Config{
-		Image:        imageID,
-		Cmd:          cmd,
-		Env:          env,
-		Tty:          false,
-		AttachStdout: true,
-		AttachStderr: true,
-	}
-
-	// Créer le conteneur
-	resp, err := s.dockerClient.ContainerCreate(ctx, config, nil, nil, nil, "")
-	if err != nil {
-		return "", fmt.Errorf("erreur lors de la création du conteneur: %w", err)
-	}
-	containerID := resp.ID
-
-	// Nettoyer le conteneur à la fin
-	defer s.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{
-		Force: true,
-	})
-
-	// Démarrer le conteneur
-	if err := s.dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		return "", fmt.Errorf("erreur lors du démarrage du conteneur: %w", err)
-	}
-
-	// Attendre que le conteneur termine
-	statusCh, errCh := s.dockerClient.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
-
-	var status container.WaitResponse
-	select {
-	case err := <-errCh:
-		return "", fmt.Errorf("erreur lors de l'attente du conteneur: %w", err)
-	case status = <-statusCh:
-		// Continuer
-	}
-
-	// Récupérer les logs
-	out, err := s.dockerClient.ContainerLogs(ctx, containerID, container.LogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-	})
-	if err != nil {
-		return "", fmt.Errorf("erreur lors de la récupération des logs: %w", err)
-	}
-	defer out.Close()
-
-	// Lire les logs
-	var output bytes.Buffer
-	_, err = stdcopy.StdCopy(&output, &output, out)
-	if err != nil {
-		return "", fmt.Errorf("erreur lors de la lecture des logs: %w", err)
-	}
-
-	// Vérifier le code de sortie
-	if status.StatusCode != 0 {
-		return output.String(), fmt.Errorf("commande terminée avec code de sortie %d", status.StatusCode)
-	}
-
-	return output.String(), nil
-}
-
-// GenerateMultistageDockerfile génère un Dockerfile multistage pour combiner plusieurs codebases
-func (s *BuildService) GenerateMultistageDockerfile(spec *BuildSpec) (string, error) {
-	if len(spec.Codebases) == 0 {
-		return "", fmt.Errorf("aucune codebase spécifiée")
-	}
-
-	var dockerfile strings.Builder
-
-	// Détecter les types de projets dans chaque codebase
-	// Cette fonction simplifiée détecte Go, Node.js, Python, et Java
-	projectTypes := make(map[string]string)
-	for _, codebase := range spec.Codebases {
-		// Dans une implémentation réelle, cette détection serait plus sophistiquée
-		if codebase.Path != "" && codebase.Path != "." {
-			projectTypes[codebase.Name] = "unknown" // Par défaut
+	} else {
+		// Single service based on the main build spec name (non-compose build)
+		mainServiceName := spec.Name
+		// Vérifier si cette image existe (au cas où le build a échoué mais on génère quand même)
+		if _, ok := result.ImageIDs[mainServiceName]; !ok && spec.RunConfigDef.ArtifactStorage != "local" {
+			fmt.Printf("Warning: Image for main service '%s' not found in results, skipping run.yml generation for it.\n", mainServiceName)
+			// Retourner un run.yml vide ou une erreur? Retournons le runYAML potentiellement vide.
 		} else {
-			projectTypes[codebase.Name] = "unknown" // Par défaut
+			runService := RunService{
+				Image:       s.getImageRefForRun(mainServiceName, spec.RunConfigDef.ArtifactStorage, result, finalImageTags),
+				Environment: runtimeEnv,
+				Command:     spec.RunConfigDef.Commands, // Utiliser les commandes globales définies
+				// Ajouter d'autres champs par défaut si nécessaire
+			}
+			runYAML.Services[mainServiceName] = runService
 		}
 	}
 
-	// Générer les étapes de build pour chaque codebase
-	for _, codebase := range spec.Codebases {
-		dockerfile.WriteString(fmt.Sprintf("# Étape de build pour %s\n", codebase.Name))
-
-		// Déterminer l'image de base selon le type de projet
-		switch projectTypes[codebase.Name] {
-		case "go":
-			dockerfile.WriteString(fmt.Sprintf("FROM golang:1.19-alpine AS %s-builder\n", codebase.Name))
-			dockerfile.WriteString(fmt.Sprintf("WORKDIR /build/%s\n", codebase.Name))
-			dockerfile.WriteString(fmt.Sprintf("COPY %s/ .\n", codebase.Name))
-			dockerfile.WriteString("RUN go build -o app .\n\n")
-		case "nodejs":
-			dockerfile.WriteString(fmt.Sprintf("FROM node:18-alpine AS %s-builder\n", codebase.Name))
-			dockerfile.WriteString(fmt.Sprintf("WORKDIR /build/%s\n", codebase.Name))
-			dockerfile.WriteString(fmt.Sprintf("COPY %s/ .\n", codebase.Name))
-			dockerfile.WriteString("RUN npm ci && npm run build\n\n")
-		case "python":
-			dockerfile.WriteString(fmt.Sprintf("FROM python:3.10-slim AS %s-builder\n", codebase.Name))
-			dockerfile.WriteString(fmt.Sprintf("WORKDIR /build/%s\n", codebase.Name))
-			dockerfile.WriteString(fmt.Sprintf("COPY %s/ .\n", codebase.Name))
-			dockerfile.WriteString("RUN pip install -r requirements.txt && python setup.py build\n\n")
-		case "java":
-			dockerfile.WriteString(fmt.Sprintf("FROM maven:3.8-openjdk-17 AS %s-builder\n", codebase.Name))
-			dockerfile.WriteString(fmt.Sprintf("WORKDIR /build/%s\n", codebase.Name))
-			dockerfile.WriteString(fmt.Sprintf("COPY %s/ .\n", codebase.Name))
-			dockerfile.WriteString("RUN mvn package -DskipTests\n\n")
-		default:
-			// Base générique pour les projets inconnus
-			dockerfile.WriteString(fmt.Sprintf("FROM alpine:latest AS %s-builder\n", codebase.Name))
-			dockerfile.WriteString(fmt.Sprintf("WORKDIR /build/%s\n", codebase.Name))
-			dockerfile.WriteString(fmt.Sprintf("COPY %s/ .\n\n", codebase.Name))
-		}
+	// Vérifier si aucun service n'a été ajouté (peut arriver si build compose échoue complètement)
+	if len(runYAML.Services) == 0 {
+		fmt.Println("Warning: No services could be added to run.yml.")
+		// Retourner une erreur ou un succès avec un fichier vide ? Succès vide pour l'instant.
 	}
 
-	// Image finale
-	baseImage := spec.BuildConfig.BaseImage
-	if baseImage == "" {
-		baseImage = "alpine:latest"
-	}
-
-	dockerfile.WriteString("# Image finale\n")
-	dockerfile.WriteString(fmt.Sprintf("FROM %s\n", baseImage))
-	dockerfile.WriteString("WORKDIR /app\n\n")
-
-	// Copier les artefacts de chaque étape de build
-	for _, codebase := range spec.Codebases {
-		switch projectTypes[codebase.Name] {
-		case "go":
-			dockerfile.WriteString(fmt.Sprintf("COPY --from=%s-builder /build/%s/app /app/%s/\n",
-				codebase.Name, codebase.Name, codebase.Name))
-		case "nodejs":
-			dockerfile.WriteString(fmt.Sprintf("COPY --from=%s-builder /build/%s/dist /app/%s/\n",
-				codebase.Name, codebase.Name, codebase.Name))
-		case "python":
-			dockerfile.WriteString(fmt.Sprintf("COPY --from=%s-builder /build/%s/build /app/%s/\n",
-				codebase.Name, codebase.Name, codebase.Name))
-		case "java":
-			dockerfile.WriteString(fmt.Sprintf("COPY --from=%s-builder /build/%s/target/*.jar /app/%s/\n",
-				codebase.Name, codebase.Name, codebase.Name))
-		default:
-			dockerfile.WriteString(fmt.Sprintf("COPY --from=%s-builder /build/%s/ /app/%s/\n",
-				codebase.Name, codebase.Name, codebase.Name))
-		}
-	}
-
-	// Exposer le port 8080 par défaut
-	dockerfile.WriteString("\nEXPOSE 8080\n\n")
-
-	// Commande par défaut
-	dockerfile.WriteString("CMD [\"sh\", \"-c\", \"echo 'Image multi-stage construite avec succès'\"]\n")
-
-	return dockerfile.String(), nil
+	return runYAML, nil
 }
 
-// SetupDockerIgnore crée un fichier .dockerignore pour exclure les fichiers inutiles
-func (s *BuildService) SetupDockerIgnore(buildDir string) error {
-	dockerignore := `# Fichiers de système
-.DS_Store
-Thumbs.db
+// getImageRefForRun détermine la référence d'image à utiliser dans run.yml
+func (s *BuildService) getImageRefForRun(serviceName, storageType string, result *BuildResult, finalImageTags map[string][]string) string {
+	switch storageType {
+	case "local":
+		if path, ok := result.LocalImagePaths[serviceName]; ok && path != "" {
+			// Retourner seulement le nom du fichier .tar
+			return filepath.Base(path)
+		}
+		// Fallback si chemin non trouvé
+		fmt.Printf("Warning: Local image path not found for service '%s' in build result.\n", serviceName)
+		return fmt.Sprintf("local:%s_image_not_found.tar", serviceName)
 
-# Répertoires de dépendances
-**/node_modules
-**/vendor
-**/.venv
-**/env
-**/venv
-**/__pycache__
+	case "docker":
+		// Utiliser le premier tag trouvé pour ce service
+		if tags, ok := finalImageTags[serviceName]; ok && len(tags) > 0 && tags[0] != "" {
+			return tags[0] // Utilise le premier tag appliqué
+		}
+		// Fallback si aucun tag trouvé (ne devrait pas arriver si build a réussi et taggé)
+		fmt.Printf("Warning: No Docker tags found for service '%s' in finalImageTags map.\n", serviceName)
+		// En dernier recours, utiliser l'ID si disponible ? Ou un tag par défaut ? Utilisons un tag par défaut.
+		if result.ImageIDs != nil {
+			if imgID, ok := result.ImageIDs[serviceName]; ok && imgID != "" {
+				fmt.Printf("Warning: Falling back to default tag for service '%s' as no specific tags were found.\n", serviceName)
+				// Construire un tag par défaut plausible (peut nécessiter le nom du projet)
+				// Ceci est un fallback, la logique de tagging dans Build() devrait être la source principale.
+				return fmt.Sprintf("%s:latest", serviceName) // Simple fallback
+			}
+		}
+		return fmt.Sprintf("docker:%s_image_or_tag_not_found", serviceName)
 
-# Fichiers de build
-**/dist
-**/build
-**/out
-**/bin
-**/target
-**/.next
-**/.nuxt
-
-# Fichiers de développement
-**/.git
-**/.github
-**/.vscode
-**/.idea
-**/*.log
-**/*.swp
-**/*.swo
-**/coverage
-**/tmp
-
-# Fichiers de configuration Docker
-Dockerfile*
-docker-compose*
-.dockerignore
-
-# Fichiers de test
-**/*_test.go
-**/test
-**/tests
-**/*.spec.js
-**/*.test.js
-`
-
-	return os.WriteFile(filepath.Join(buildDir, ".dockerignore"), []byte(dockerignore), 0644)
+	default: // Cas inconnu ou ""
+		fmt.Printf("Warning: Unknown artifact storage type '%s'. Falling back to default behavior.\n", storageType)
+		// Comportement par défaut : essayer tag docker, puis id, puis fallback
+		if tags, ok := finalImageTags[serviceName]; ok && len(tags) > 0 && tags[0] != "" {
+			return tags[0]
+		}
+		if result.ImageIDs != nil {
+			if imgID, ok := result.ImageIDs[serviceName]; ok && imgID != "" {
+				return imgID // Retourne l'ID si pas de tag
+			}
+		}
+		return fmt.Sprintf("unknown_storage:%s_not_found", serviceName)
+	}
 }
 
-// GenerateImageReport crée un rapport détaillé sur une image Docker
-func (s *BuildService) GenerateImageReport(ctx context.Context, imageID string) (map[string]interface{}, error) {
-	report := make(map[string]interface{})
+// --- Other Existing Functions (Potentially useful, keep for now) ---
+// CreateContainer, RunContainer, ExportContainer, Cleanup, UploadArtifactToB2,
+// DownloadImageFromB2, BuildWithMultipleCodebases, SaveDockerImageToBuffer,
+// CreateDockerfileFromMultipleCodebases, BuildWithBufferInput, GetImageInfo,
+// TagImage, PushImage, CompressAndUploadArtifacts, ExecuteInContainer,
+// GenerateMultistageDockerfile, SetupDockerIgnore, GenerateImageReport
 
-	// Informations générales sur l'image
-	inspect, _, err := s.dockerClient.ImageInspectWithRaw(ctx, imageID)
-	if err != nil {
-		return nil, fmt.Errorf("erreur lors de l'inspection de l'image: %w", err)
-	}
+// Note: Some functions like BuildWithMultipleCodebases might be redundant now
+// that the main Build function handles codebases properly. Review and refactor/remove later.
+// ExecuteInContainer might be useful for BuildSteps binary extraction, but needs refinement.
+// Added import for "github.com/docker/docker/pkg/term" for pull progress
 
-	report["image_id"] = inspect.ID
-	report["created"] = inspect.Created
-	report["size"] = inspect.Size
-	report["virtual_size"] = inspect.VirtualSize
-	report["tags"] = inspect.RepoTags
-	report["labels"] = inspect.Config.Labels
-	report["entrypoint"] = inspect.Config.Entrypoint
-	report["cmd"] = inspect.Config.Cmd
-	report["env"] = inspect.Config.Env
-	report["exposed_ports"] = inspect.Config.ExposedPorts
-	report["os"] = inspect.Os
-	report["architecture"] = inspect.Architecture
+// Placeholder pour l'implémentation du SecretFetcher si non fourni
+type DummySecretFetcher struct{}
 
-	// Récupérer l'historique de l'image
-	history, err := s.dockerClient.ImageHistory(ctx, imageID)
-	if err != nil {
-		return report, fmt.Errorf("erreur lors de la récupération de l'historique: %w", err)
-	}
-
-	historyInfo := make([]map[string]interface{}, 0, len(history))
-	for _, layer := range history {
-		historyInfo = append(historyInfo, map[string]interface{}{
-			"created":    layer.Created,
-			"created_by": layer.CreatedBy,
-			"size":       layer.Size,
-			"comment":    layer.Comment,
-			"tags":       layer.Tags,
-		})
-	}
-	report["history"] = historyInfo
-
-	return report, nil
+func (d *DummySecretFetcher) GetSecret(ctx context.Context, source string) (string, error) {
+	fmt.Printf("Warning: Using DummySecretFetcher. Secret '%s' not actually fetched.\n", source)
+	// Retourner une valeur placeholder ou une erreur selon le comportement souhaité
+	return fmt.Sprintf("dummy-secret-for-%s", source), nil
+	// Ou: return "", fmt.Errorf("secret fetcher not implemented")
 }
