@@ -14,7 +14,7 @@ import (
 	"time"
 
 	// Importer le package socket (ajuster le chemin si nécessaire)
-	"anexis/socket"
+	"github.com/Treefle-labs/Anexis/socket"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/pkg/jsonmessage" // Nécessaire pour le writer de logs

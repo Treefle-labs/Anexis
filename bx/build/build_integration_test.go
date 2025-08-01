@@ -12,7 +12,7 @@ import (
 	"time"
 
 	// Importer socket et testify etc.
-	"anexis/socket" // Ajuster le chemin si besoin
+	"github.com/Treefle-labs/Anexis/socket" // Ajuster le chemin si besoin
 
 	"github.com/docker/docker/client"
 	"github.com/stretchr/testify/assert"

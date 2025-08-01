@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time" // Pour docker load
 
-	"anexis/bx/build"
-	"anexis/socket" // Pour parser RunYAML
+	"github.com/Treefle-labs/Anexis/bx/build"
+	"github.com/Treefle-labs/Anexis/socket" // Pour parser RunYAML
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -54,7 +54,7 @@ func runRunCommand(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("erreur lors de la lecture de '%s': %w", runFile, err)
 	}
 
-	var runConfig build.Bui
+	var runConfig build.RunYAML
 	err = yaml.Unmarshal(runData, &runConfig)
 	if err != nil {
 		return fmt.Errorf("erreur lors du parsing YAML de '%s': %w", runFile, err)

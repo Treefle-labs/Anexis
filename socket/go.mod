@@ -1,4 +1,4 @@
-module anexis/socket
+module github.com/Treefle-labs/Anexis/socket
 
 go 1.24.2
 

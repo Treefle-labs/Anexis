@@ -1,4 +1,4 @@
-module anexis/bx
+module github.com/Treefle-labs/Anexis/bx
 
 go 1.24.2
 
