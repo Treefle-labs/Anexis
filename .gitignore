@@ -26,7 +26,8 @@ go.work.sum
 
 .vscode
 client
-node_modules
+/**/node_modules
 test.db
 bin
 rsa/
+/**/**TODO.md
