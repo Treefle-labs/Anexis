@@ -1,3 +1,3 @@
-# projet Anexis
+# Anexis - Bx
 
-Ceci est le repository officiel du projet `Anexis`
+A modern IAC for what you would like to build make your software reflect what you image.
