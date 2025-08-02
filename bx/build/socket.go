@@ -1,36 +1,24 @@
 package build
 
 import (
-	// ... autres imports ...
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log" // Pour les logs internes
+	"log" // For internal logs
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	// Importer le package socket (ajuster le chemin si nécessaire)
 	"github.com/Treefle-labs/Anexis/socket"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/pkg/jsonmessage" // Nécessaire pour le writer de logs
+	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/moby/go-archive"
 	// ...
 )
-
-// Assurer que BuildService implémente les interfaces requises par le serveur socket
-var _ socket.BuildTriggerer = (*BuildService)(nil)
-var _ socket.SecretFetcher = (*BuildService)(nil)
-
-// --- Implémentation de socket.SecretFetcher ---
-
-// GetSecret récupère un secret en utilisant le fetcher configuré dans BuildService.
-// Ceci suppose que vous avez déjà un moyen de récupérer les secrets DANS BuildService.
-// Si ce n'est pas le cas, vous devrez adapter cette partie.
 
 
 // --- Implémentation de socket.BuildTriggerer ---
@@ -40,7 +28,7 @@ type logNotifierWriter struct {
 	buildID  string
 	stream   string // "stdout" or "stderr"
 	notifier socket.BuildNotifier
-	mu       sync.Mutex // Protéger les appels concurrents potentiels à Write
+	mu       sync.Mutex
 }
 
 func newLogNotifierWriter(buildID string, stream string, notifier socket.BuildNotifier) *logNotifierWriter {

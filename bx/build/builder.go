@@ -36,42 +36,6 @@ import (
 )
 
 
-// UnmarshalYAML handle the case which `build: ./context` and `build: {context: ...}`
-func (cb *ComposeBuild) UnmarshalYAML(value *yaml.Node) error {
-	if value.Kind == yaml.ScalarNode { // Case build: ./context
-		cb.Context = value.Value
-		return nil
-	}
-	// Case build: { ... } (map)
-	// use a temp type to avoid the infinite recursion
-	type ComposeBuildMap struct {
-		Context    string             `yaml:"context,omitempty"`
-		Dockerfile string             `yaml:"dockerfile,omitempty"`
-		Args       map[string]*string `yaml:"args,omitempty"`
-		Target     string             `yaml:"target,omitempty"`
-		CacheFrom  []string           `yaml:"cache_from,omitempty"`
-		Labels     map[string]string  `yaml:"labels,omitempty"`
-		Network    string             `yaml:"network,omitempty"`
-	}
-	var temp ComposeBuildMap
-	if err := value.Decode(&temp); err != nil {
-		return err
-	}
-	cb.Context = temp.Context
-	cb.Dockerfile = temp.Dockerfile
-	cb.Args = temp.Args
-	cb.Target = temp.Target
-	cb.CacheFrom = temp.CacheFrom
-	cb.Labels = temp.Labels
-	cb.Network = temp.Network
-
-	// Apply the default if context is empty but build is a non empty map
-	if cb.Context == "" && !value.IsZero() && value.Kind == yaml.MappingNode {
-		cb.Context = "."
-	}
-	return nil
-}
-
 // This is a healthcheck simplified struct
 type HealthCheck struct {
 	Test        []string `yaml:"test,omitempty"`
@@ -79,11 +43,6 @@ type HealthCheck struct {
 	Timeout     string   `yaml:"timeout,omitempty"`
 	Retries     *int     `yaml:"retries,omitempty"`
 	StartPeriod string   `yaml:"start_period,omitempty"`
-}
-
-// Interface for an extern secrets service provider
-type SecretFetcher interface {
-	GetSecret(ctx context.Context, source string) (string, error) // Must return the secret value
 }
 
 // --- Service Initialization ---
@@ -133,96 +92,6 @@ func (s *BuildService) SetB2Config(config *B2Config) {
 	s.b2Config = config
 }
 
-// --- Configuration Loading ---
-
-// Load the build config from a file
-func LoadBuildSpecFromFile(filename string) (*BuildSpec, error) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read the build file specification '%s': %w", filename, err)
-	}
-	return LoadBuildSpecFromBytes(data, filepath.Ext(filename))
-}
-
-// Load the build config from byte array
-func LoadBuildSpecFromBytes(data []byte, format string) (*BuildSpec, error) {
-	var spec BuildSpec
-	var err error
-
-	// Set defaults
-	spec.BuildConfig.OutputTarget = "docker"     // Default output target
-	spec.RunConfigDef.Generate = true            // Default to generating run config
-	spec.RunConfigDef.ArtifactStorage = "docker" // Default artifact storage for run config
-
-	if format == ".json" {
-		err = json.Unmarshal(data, &spec)
-	} else if format == ".yaml" || format == ".yml" {
-		err = yaml.Unmarshal(data, &spec)
-	} else {
-		// Try YAML decoding by default if format is unknown or missing
-		err = yaml.Unmarshal(data, &spec)
-		if err != nil {
-			// If YAML fails, try JSON as a fallback
-			errJson := json.Unmarshal(data, &spec)
-			if errJson != nil {
-				return nil, fmt.Errorf("invalid format. YAML error: %v, JSON error: %v", err, errJson)
-			}
-			err = nil // JSON succeeded
-		}
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("specification parsing failed (format: %s): %w", format, err)
-	}
-
-	// Basic Validation
-	if spec.Name == "" || spec.Version == "" {
-		return nil, fmt.Errorf("the fields 'name' and 'version' are required in the specification")
-	}
-	if len(spec.Codebases) == 0 && len(spec.BuildSteps) == 0 && spec.BuildConfig.Dockerfile == "" && spec.BuildConfig.ComposeFile == "" {
-		return nil, fmt.Errorf("no codebase, build_step, dockerfile or compose_file specified")
-	}
-	if spec.BuildConfig.Dockerfile != "" && spec.BuildConfig.ComposeFile != "" {
-		return nil, fmt.Errorf("don't specify 'dockerfile' et 'compose_file' in the build_config")
-	}
-
-	return &spec, nil
-}
-
-// parse a compose file
-func LoadComposeFile(data []byte) (*ComposeProject, error) {
-	var project ComposeProject
-	err := yaml.Unmarshal(data, &project)
-	if err != nil {
-		return nil, fmt.Errorf("error during the compose YAML file parsing: %w", err)
-	}
-	if len(project.Services) == 0 {
-		return nil, fmt.Errorf("no service section found in the compose file config")
-	}
-	// Initializing the maps/slices nil to avoid the nil pointer panics
-	for _, service := range project.Services {
-		if service.Environment == nil {
-			service.Environment = make(map[string]*string)
-		}
-		if service.Build != nil && service.Build.Args == nil {
-			service.Build.Args = make(map[string]*string)
-		}
-		// TODO: do this for other map slice...
-	}
-	return &project, nil
-}
-
-func (s *BuildService) GetSecret(ctx context.Context, source string) (string, error) {
-	s.mutex.Lock()
-	fetcher := s.secretFetcher
-	defer s.mutex.Unlock()
-
-	if fetcher == nil {
-		// Using the default DummySecretFetcher if no fetcher is initialized
-		fetcher = &DummySecretFetcher{}
-	}
-	return fetcher.GetSecret(ctx, source)
-}
 
 // --- Core Build Logic ---
 

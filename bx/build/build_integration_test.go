@@ -4,6 +4,7 @@ package build
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -32,7 +33,7 @@ func TestIntegration_SocketTriggeredBuild_LocalOutput(t *testing.T) {
 	require.NoError(t, err)
 
 	// 2. Setup et démarrer le Serveur Socket
-	socketServer := socket.NewServer(buildService, buildService) // buildService implémente les deux interfaces
+	socketServer := socket.NewServer(buildService, buildService, func(r *http.Request) bool {return true}) // buildService implémente les deux interfaces
 	socketServer.Run()
 	httpServer := httptest.NewServer(socketServer)
 	defer httpServer.Close()
