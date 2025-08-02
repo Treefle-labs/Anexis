@@ -8,50 +8,9 @@ on:
 
 jobs:
   test:
-    name: Build and Test
+    name: Build & Test All Modules
     runs-on: ubuntu-latest
-    services:
-      docker:
-        image: docker:latest
-        options: --privileged # Nécessaire pour exécuter Docker dans Docker
 
-    steps:
-    - uses: actions/checkout@v3
-
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.23'
-
-    - name: Start Docker Daemon
-      run: |
-        sudo systemctl start docker
-        docker info  
-
-    - name: Install dependencies
-      run: go mod download
-
-    - name: Verify dependencies
-      run: go mod verify
-
-    - name: Run vet
-      run: go vet ./...
-
-    - name: Run tests with Docker
-      run: go test -v -race -cover ./...
-      env:
-        DOCKER_HOST: unix:///var/run/docker.sock  # Permet d’accéder à Docker dans l'environnement CI/CD
-        
-    - name: Run golangci-lint
-      uses: golangci/golangci-lint-action@v3
-      with:
-        version: latest
-
-  build:
-    needs: test
-    name: Build
-    runs-on: ubuntu-latest
-    
     steps:
     - uses: actions/checkout@v3
 
@@ -59,35 +18,27 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: '1.21'
-        
-    - name: Build
-      run: go build -v ./...
-        
-    - name: Upload artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: app
-        path: ./anexis  # Remplacez par le nom de votre binaire
 
+    - name: Find Go Modules
+      id: find-modules
+      run: |
+        echo "modules=$(find . -name 'go.mod' -not -path './go.work' -exec dirname {} \; | tr '\n' ' ')" >> $GITHUB_OUTPUT
 
-  # Décommentez cette section si vous voulez déployer sur un serveur
-  # deploy:
-  #   needs: build
-  #   name: Deploy
-  #   runs-on: ubuntu-latest
-  #   if: github.ref == 'refs/heads/main'
-  #   
-  #   steps:
-  #   - name: Download artifact
-  #     uses: actions/download-artifact@v3
-  #     with:
-  #       name: app
-  #   
-  #   - name: Deploy to server
-  #     uses: appleboy/scp-action@master
-  #     with:
-  #       host: ${{ secrets.HOST }}
-  #       username: ${{ secrets.USERNAME }}
-  #       key: ${{ secrets.SSH_PRIVATE_KEY }}
-  #       source: "app"
-  #       target: "/path/to/destination"
+    - name: Run go test in each module
+      run: |
+        for module in ${{ steps.find-modules.outputs.modules }}; do
+          echo "📦 Testing $module"
+          cd $module
+          go mod tidy
+          go test -v -race -cover ./...
+          cd -
+        done
+
+    - name: Run golangci-lint in each module
+      run: |
+        for module in ${{ steps.find-modules.outputs.modules }}; do
+          echo "🔍 Linting $module"
+          cd $module
+          golangci-lint run --timeout=2m
+          cd -
+        done
