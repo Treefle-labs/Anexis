@@ -32,7 +32,7 @@ type Client struct {
 	pendingMu       sync.RWMutex
 }
 
-// Creating anew client for a websocket connection.
+// Creating a new client for a websocket connection.
 func NewClient() *Client {
 	return &Client{
 		Incoming:        make(chan *Message, 100), // Buffer for incoming messages
