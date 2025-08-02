@@ -1,4 +1,3 @@
-// socket/hub.go
 package socket
 
 import (
@@ -6,21 +5,19 @@ import (
 	"sync"
 )
 
-// Hub maintient l'ensemble des clients actifs et diffuse les messages.
 type Hub struct {
-	clients    map[*connection]bool // Utiliser la connexion comme clé, booléen juste pour la présence
-	register   chan *connection     // Canal pour enregistrer de nouveaux clients
-	unregister chan *connection     // Canal pour désenregistrer les clients
-	// broadcast chan *Message // Si vous avez besoin de diffuser à tous (moins utile pour ce cas d'usage)
+	clients    map[*connection]bool // List of connection registered
+	register   chan *connection     // Channel for connection registration
+	unregister chan *connection     // Channel for connection removing
+	broadcast  chan *Message        // Diffusing message for all registered instance
 
-	// Mutex pour protéger l'accès à la map clients
 	mu sync.RWMutex
 
-	// Référence au handler métier pour traiter les messages entrants
+	// Handler for incoming message
 	messageHandler func(msg *Message, client *connection) error
 }
 
-// newHub crée un nouveau Hub.
+
 func newHub(handler func(msg *Message, client *connection) error) *Hub {
 	return &Hub{
 		clients:    make(map[*connection]bool),
@@ -31,8 +28,7 @@ func newHub(handler func(msg *Message, client *connection) error) *Hub {
 	}
 }
 
-// run démarre la boucle principale du Hub pour gérer les enregistrements/désenregistrements.
-// Doit être lancée dans une goroutine.
+// handling registration/removing clients connection asynchronously
 func (h *Hub) run() {
 	log.Println("Hub: Starting run loop")
 	for {
@@ -47,7 +43,6 @@ func (h *Hub) run() {
 			h.mu.Lock()
 			if _, ok := h.clients[conn]; ok {
 				delete(h.clients, conn)
-				// Important: Fermer le canal d'envoi de la connexion pour arrêter sa writePump
 				conn.closeSend()
 				log.Printf("Hub: Client unregistered (%p). Total clients: %d\n", conn.ws, len(h.clients))
 			} else {
@@ -55,35 +50,33 @@ func (h *Hub) run() {
 			}
 			h.mu.Unlock()
 
-			/* // Logique de broadcast si nécessaire
-			case message := <-h.broadcast:
-				h.mu.RLock()
-				for conn := range h.clients {
-					select {
-					case conn.send <- message:
-					default:
-						log.Printf("Hub: Broadcast failed for client %p, closing its send channel.\n", conn.ws)
-						close(conn.send) // Ferme le canal pour ce client lent/mort
-						delete(h.clients, conn) // Supprimer immédiatement ? Attention à l'itération RLock
-					}
+		case message := <-h.broadcast:
+			h.mu.RLock()
+			for conn := range h.clients {
+				select {
+				case conn.send <- message:
+				default:
+					log.Printf("Hub: Broadcast failed for client %p, closing its send channel.\n", conn.ws)
+					close(conn.send)       
+					delete(h.clients, conn)
 				}
-				h.mu.RUnlock()
-			*/
+			}
+			h.mu.RUnlock()
+
 		}
 	}
 }
 
-// handleDisconnect est appelé par la readPump d'une connexion lorsqu'elle se termine.
+// Calling this handler if a connection is disconnected
 func (h *Hub) handleDisconnect(conn *connection) {
 	h.unregister <- conn
 }
 
-// handleIncomingMessage est passé à la readPump pour traiter les messages reçus.
+// handler passed to readPump for incoming message.
 func (h *Hub) handleIncomingMessage(msg *Message, conn *connection) error {
-	// Logique métier déléguée au handler fourni lors de la création du hub
 	if h.messageHandler != nil {
 		return h.messageHandler(msg, conn)
 	}
 	log.Printf("Hub: No message handler configured, dropping message type %s from %p\n", msg.Type, conn.ws)
-	return nil // Ne pas retourner d'erreur pour ne pas fermer la connexion
+	return nil
 }

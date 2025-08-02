@@ -3,6 +3,7 @@ package socket
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -13,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// --- Mocks pour BuildTriggerer et SecretFetcher ---
 
 type MockBuildTriggerer struct {
 	StartBuildFunc func(ctx context.Context, buildID string, buildSpecYAML string, notifier BuildNotifier) error
@@ -41,31 +41,29 @@ func (m *MockSecretFetcher) GetSecret(ctx context.Context, source string) (strin
 
 func TestSocket_ClientServerCommunication(t *testing.T) {
 	// 1. Setup Mock Services
-	var wg sync.WaitGroup       // Pour attendre les goroutines de notification
+	var wg sync.WaitGroup 
 	var receivedBuildID string
 	var receivedBuildSpec string
 
 	mockBuildSvc := &MockBuildTriggerer{
 		StartBuildFunc: func(ctx context.Context, buildID string, buildSpecYAML string, notifier BuildNotifier) error {
 			t.Logf("MockBuildTriggerer: StartBuildAsync called for BuildID: %s\n", buildID)
-			receivedBuildID = buildID // Capturer pour vérification
+			receivedBuildID = buildID // Catching this for verification
 			receivedBuildSpec = buildSpecYAML
 
-			// Simuler un build en arrière-plan qui envoie des logs et un statut
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				time.Sleep(50 * time.Millisecond) // Simuler le travail
+				time.Sleep(50 * time.Millisecond)
 				notifier.NotifyLog(buildID, "stdout", "Fetching code...")
 				time.Sleep(50 * time.Millisecond)
 				notifier.NotifyLog(buildID, "stdout", "Building image...")
 				time.Sleep(50 * time.Millisecond)
-				// Simuler un succès
 				duration := 150.0 * time.Millisecond.Seconds()
 				notifier.NotifyStatus(buildID, "success", "docker.io/library/test:latest", nil, &duration)
 				t.Logf("MockBuildTriggerer: Sent final status for BuildID: %s\n", buildID)
 			}()
-			return nil // Retourner nil pour indiquer que le lancement async a réussi
+			return nil
 		},
 	}
 
@@ -80,13 +78,13 @@ func TestSocket_ClientServerCommunication(t *testing.T) {
 	}
 
 	// 2. Start Test Server
-	server := NewServer(mockBuildSvc, mockSecretSvc)
-	server.Run() // Démarre le hub
+	server := NewServer(mockBuildSvc, mockSecretSvc, func(r *http.Request) bool {return true})
+	server.Run()
 
-	httpServer := httptest.NewServer(server) // Utilise le ServeHTTP du serveur socket
+	httpServer := httptest.NewServer(server)
 	defer httpServer.Close()
 
-	// Convertir l'URL HTTP en WS
+	// Convert the HTTP url into WS url prefixed
 	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http")
 	t.Logf("Test WebSocket Server running at: %s\n", wsURL)
 
@@ -94,15 +92,15 @@ func TestSocket_ClientServerCommunication(t *testing.T) {
 	client := NewClient()
 	err := client.Connect(wsURL, nil)
 	require.NoError(t, err, "Client failed to connect")
-	defer client.Close() // S'assurer que le client est fermé
+	defer client.Close() // Be sure that client is closed
 
 	require.True(t, client.IsConnected(), "Client should be connected")
 
 	// 4. Test Build Request / Response Flow
-	buildMessagesReceived := make(chan *Message, 10) // Buffer pour collecter les messages liés au build
+	buildMessagesReceived := make(chan *Message, 10) // Buffer to collect the build messages
 	go func() {
 		for msg := range client.Incoming {
-			// Filtrer les messages pour ce test
+			// Filter messages for this specific test
 			if msg.Type == EvtBuildQueued || msg.Type == EvtLogChunk || msg.Type == EvtBuildStatus {
 				buildMessagesReceived <- msg
 			} else {
@@ -110,36 +108,36 @@ func TestSocket_ClientServerCommunication(t *testing.T) {
 			}
 		}
 		t.Log("Client Incoming Monitor: Exited.")
-		close(buildMessagesReceived) // Fermer quand client.Incoming est fermé
+		close(buildMessagesReceived) // Close if client.Incoming is closed
 	}()
 
-	// Envoyer la requête de build
-	buildSpecContent := "name: test-build\nversion: '1.0'\n..." // Contenu YAML factice
+	// Send the build request
+	buildSpecContent := "name: test-build\nversion: '1.0'\n..." // Mock YAML content
 	buildReqPayload := BuildRequestPayload{BuildSpecYAML: buildSpecContent}
 	ctxReq, cancelReq := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelReq()
 
-	// Utiliser SendRequest pour obtenir l'accusé de réception (BuildQueued)
+	// Use SendRequest to get the acknowledgement of receipt (BuildQueued)
 	respMsg, err := client.SendRequest(ctxReq, EvtBuildRequest, buildReqPayload)
 	require.NoError(t, err, "SendRequest for build failed")
 	require.NotNil(t, respMsg, "Response message should not be nil")
 	require.Equal(t, EvtBuildQueued, respMsg.Type, "Response should be BuildQueued")
 
-	// Décoder le payload de la réponse pour obtenir le buildID
+	// Decode the response payload to get the buildID
 	var queuedPayload BuildQueuedPayload
 	err = respMsg.DecodePayload(&queuedPayload)
 	require.NoError(t, err)
 	require.NotEmpty(t, queuedPayload.BuildID, "BuildID should be in queued payload")
-	assert.Equal(t, queuedPayload.BuildID, receivedBuildID, "BuildID in response should match ID received by mock service") // Vérifier la cohérence
+	assert.Equal(t, queuedPayload.BuildID, receivedBuildID, "BuildID in response should match ID received by mock service")
 	assert.Equal(t, buildSpecContent, receivedBuildSpec, "BuildSpec received by mock should match sent spec")
 
-	// Attendre les messages streamés (logs, status final)
+	// Waiting for streaming messages (logs, status final)
 	expectedLogs := []string{"Fetching code...", "Building image..."}
 	receivedLogs := []string{}
 	var finalStatusPayload BuildStatusPayload
 	receivedFinalStatus := false
 
-	timeout := time.After(3 * time.Second) // Timeout pour attendre les messages streamés
+	timeout := time.After(3 * time.Second) // Timeout for waiting for the streaming messages
 	logLoopDone := false
 	for !logLoopDone {
 		select {
@@ -147,7 +145,7 @@ func TestSocket_ClientServerCommunication(t *testing.T) {
 			if !ok {
 				t.Log("Build message channel closed.")
 				logLoopDone = true
-				break // Sortir si le canal est fermé
+				break
 			}
 			t.Logf("Client Received Async Message: Type=%s", msg.Type)
 			switch msg.Type {
@@ -162,14 +160,14 @@ func TestSocket_ClientServerCommunication(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, receivedBuildID, finalStatusPayload.BuildID)
 				receivedFinalStatus = true
-				logLoopDone = true // On a reçu le statut final
+				logLoopDone = true
 			}
 		case <-timeout:
 			t.Fatal("Timeout waiting for streamed build messages (logs/status)")
 		}
 	}
 
-	// Vérifier les logs et le statut final reçus
+	// Check the logs and the final status
 	assert.ElementsMatch(t, expectedLogs, receivedLogs, "Received logs do not match expected logs")
 	require.True(t, receivedFinalStatus, "Should have received a final build status")
 	assert.Equal(t, "success", finalStatusPayload.Status)
@@ -193,22 +191,20 @@ func TestSocket_ClientServerCommunication(t *testing.T) {
 	assert.Equal(t, "valid/secret", secretRespPayload.Source)
 	assert.Equal(t, "secret_value_123", secretRespPayload.Value)
 
-	// Test secret non trouvé
+	// Test secret not found
 	secretReqPayloadFail := SecretRequestPayload{Source: "invalid/secret"}
 	ctxSecretFail, cancelSecretFail := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancelSecretFail()
 
 	_, err = client.SendRequest(ctxSecretFail, EvtSecretRequest, secretReqPayloadFail)
 	require.Error(t, err, "SendRequest for invalid secret should fail")
-	assert.Contains(t, err.Error(), "secret 'invalid/secret' not found") // Vérifier l'erreur du serveur renvoyée
+	assert.Contains(t, err.Error(), "secret 'invalid/secret' not found")
 
-	// Attendre que la goroutine de notification du mock se termine
 	wg.Wait()
 	t.Log("Mock Build goroutine finished.")
 
-	// Fermer explicitement le client pour terminer le moniteur Incoming
 	client.Close()
-	// Attendre un court instant pour que le canal `buildMessagesReceived` se ferme
+	// Waiting for the `buildMessagesReceived` chanel to be closed
 	<-time.After(100 * time.Millisecond)
 
 }
