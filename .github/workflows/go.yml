@@ -20,15 +20,13 @@ jobs:
         go-version: '1.21'
 
     - name: Find Go Modules
-      id: mods
+      id: find-modules
       run: |
-        echo "modules<<EOF" >> $GITHUB_OUTPUT
-        find . -name 'go.mod' -not -path './go.work' -exec dirname {} \; >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+        echo "modules=$(find . -name 'go.mod' -not -path './go.work' -exec dirname {} \; | tr '\n' ' ')" >> $GITHUB_OUTPUT
 
-    - name: Run go test for each module
+    - name: Run go test in each module
       run: |
-        for module in ${{ steps.mods.outputs.modules }}; do
+        for module in ${{ steps.find-modules.outputs.modules }}; do
           echo "📦 Testing $module"
           cd $module
           go mod tidy
@@ -36,12 +34,11 @@ jobs:
           cd -
         done
 
-    - name: Run golangci-lint for each module
-      uses: golangci/golangci-lint-action@v3
-      with:
-        version: latest
-        skip-cache: true
-        args: |
-          run --timeout 2m
-      env:
-        GOLANGCI_LINT_RUN_MODULES: ${{ steps.mods.outputs.modules }}
+    - name: Run golangci-lint in each module
+      run: |
+        for module in ${{ steps.find-modules.outputs.modules }}; do
+          echo "🔍 Linting $module"
+          cd $module
+          golangci-lint run --timeout=2m
+          cd -
+        done
