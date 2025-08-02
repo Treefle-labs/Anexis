@@ -14,6 +14,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var (
+	receivedBuildID   string
+	receivedBuildSpec string
+	wg                sync.WaitGroup
+	mu                sync.Mutex
+)
 
 type MockBuildTriggerer struct {
 	StartBuildFunc func(ctx context.Context, buildID string, buildSpecYAML string, notifier BuildNotifier) error
@@ -41,15 +47,14 @@ func (m *MockSecretFetcher) GetSecret(ctx context.Context, source string) (strin
 
 func TestSocket_ClientServerCommunication(t *testing.T) {
 	// 1. Setup Mock Services
-	var wg sync.WaitGroup 
-	var receivedBuildID string
-	var receivedBuildSpec string
 
 	mockBuildSvc := &MockBuildTriggerer{
 		StartBuildFunc: func(ctx context.Context, buildID string, buildSpecYAML string, notifier BuildNotifier) error {
 			t.Logf("MockBuildTriggerer: StartBuildAsync called for BuildID: %s\n", buildID)
+			mu.Lock()
 			receivedBuildID = buildID // Catching this for verification
 			receivedBuildSpec = buildSpecYAML
+			mu.Unlock()
 
 			wg.Add(1)
 			go func() {
@@ -78,7 +83,7 @@ func TestSocket_ClientServerCommunication(t *testing.T) {
 	}
 
 	// 2. Start Test Server
-	server := NewServer(mockBuildSvc, mockSecretSvc, func(r *http.Request) bool {return true})
+	server := NewServer(mockBuildSvc, mockSecretSvc, func(r *http.Request) bool { return true })
 	server.Run()
 
 	httpServer := httptest.NewServer(server)
@@ -128,8 +133,10 @@ func TestSocket_ClientServerCommunication(t *testing.T) {
 	err = respMsg.DecodePayload(&queuedPayload)
 	require.NoError(t, err)
 	require.NotEmpty(t, queuedPayload.BuildID, "BuildID should be in queued payload")
+	mu.Lock()
 	assert.Equal(t, queuedPayload.BuildID, receivedBuildID, "BuildID in response should match ID received by mock service")
 	assert.Equal(t, buildSpecContent, receivedBuildSpec, "BuildSpec received by mock should match sent spec")
+	mu.Unlock()
 
 	// Waiting for streaming messages (logs, status final)
 	expectedLogs := []string{"Fetching code...", "Building image..."}
