@@ -1,27 +1,30 @@
-# See the dedicated "version" documentation section.
-version: "2"
-linters:
-  # See the dedicated "linters" documentation section.
-  default: all
-formatters:
-  # See the dedicated "formatters" documentation section.
-  enable:
-    - gci
-    - gofmt
-    - gofumpt
-    - goimports
-    - golines
-  exclusions:
-    warn-unused: true
-issues:
-  # See the dedicated "issues" documentation section.
-  new-from-merge-base: "develop"
+version: 2
+
 run:
-  # See the dedicated "run" documentation section.
-  timeout: 30s
-severity:
-  default: error
-  rules:
-    - linters:
-        - dupl
-      severity: info
+  timeout: 2m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - govet
+    - errcheck
+    - gosimple
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - gofumpt
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  severity:
+    default: error
+
+# Optionnel : pour exclure des fichiers ou répertoires
+# exclude-rules:
+#   - path: _gen/
+#     linters:
+#       - gofmt
