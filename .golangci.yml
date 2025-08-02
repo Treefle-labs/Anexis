@@ -1,11 +1,10 @@
-version: 2
+version: "2"
 
 run:
   timeout: 2m
   tests: true
 
 linters:
-  disable-all: true
   enable:
     - govet
     - errcheck
@@ -17,11 +16,8 @@ linters:
     - gofumpt
 
 issues:
-  exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0
-  severity:
-    default: error
 
 # Optionnel : pour exclure des fichiers ou répertoires
 # exclude-rules:
